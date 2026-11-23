@@ -22,7 +22,11 @@ class Connection:
 
     @property
     def is_connected(self) -> bool:
-        return self._is_connected and self.websocket is not None and not self.websocket.closed
+        if not self._is_connected or self.websocket is None:
+            return False
+        if hasattr(self.websocket, 'closed'):
+            return not self.websocket.closed
+        return True
 
     async def connect(self):
         async with self._connect_lock:
@@ -37,12 +41,15 @@ class Connection:
             }
             try:
                 logger.info(f"Attempting to connect to {self.uri}...")
-                self.websocket = await websockets.connect(
-                    self.uri,
-                    extra_headers=headers,
-                    ping_interval=None, # Disable automatic pings if we handle manually
-                    open_timeout=parameters.DEFAULT_CONNECT_TIMEOUT
-                )
+                import inspect
+                connect_sig = inspect.signature(websockets.connect)
+                header_param = "additional_headers" if "additional_headers" in connect_sig.parameters else "extra_headers"
+                connect_kwargs = {
+                    header_param: headers,
+                    "ping_interval": None,
+                    "open_timeout": parameters.DEFAULT_CONNECT_TIMEOUT
+                }
+                self.websocket = await websockets.connect(self.uri, **connect_kwargs)
                 self._is_connected = True
                 logger.info("✅ WebSocket connection established.")
                 # Start the receiver loop

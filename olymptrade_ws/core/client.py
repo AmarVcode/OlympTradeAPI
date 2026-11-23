@@ -351,20 +351,27 @@ class OlympTradeClient:
         import uuid
         for _ in range(2):
             await self.send_request(90, {}, requires_response=True)  # uuid auto-generated
-        # 3. Request account info (demo and real)
-        self.account_id = self.account_id or None
-        self.account_group = self.account_group or None
-        for group in ["demo", "real"]:
-            try:
-                resp = await self.send_request(1068, [{"group": group}], requires_response=True)
-                logger.info(f"Account info response for group {group}: {resp}")
-                if resp and 'd' in resp and isinstance(resp['d'], list) and resp['d']:
-                    self.account_id = resp['d'][0].get('account_id')
-                    self.account_group = group
-                    logger.info(f"Set account_id to {self.account_id} (group: {group})")
+        # 3. Check if account info was already received via event 55 (balance update)
+        if self._latest_balance and 'd' in self._latest_balance and isinstance(self._latest_balance['d'], list):
+            for acc in self._latest_balance['d']:
+                if acc.get('group') == (self.account_group or 'demo'):
+                    self.account_id = acc.get('account_id')
+                    self.account_group = acc.get('group')
+                    logger.info(f"Detected account_id {self.account_id} ({self.account_group}) from initial balance push.")
                     break
-            except Exception as e:
-                logger.warning(f"Failed to get account_id for group {group}: {e}")
+
+        if not self.account_id:
+            for group in ["demo", "real"]:
+                try:
+                    resp = await self.send_request(1068, [{"group": group}], requires_response=True, timeout=3.0)
+                    logger.info(f"Account info response for group {group}: {resp}")
+                    if resp and 'd' in resp and isinstance(resp['d'], list) and resp['d']:
+                        self.account_id = resp['d'][0].get('account_id')
+                        self.account_group = group
+                        logger.info(f"Set account_id to {self.account_id} (group: {group})")
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to get account_id for group {group}: {e}")
         if not self.account_id:
             logger.error("Could not determine account_id from account info requests.")
         # 4. Request balance for the found account_id

@@ -100,17 +100,20 @@ class MarketAPI:
             # Optionally send the secondary request (e:282) if needed - requires_response=False?
             # await self._client.send_request(event_code_req_alt, data_alt, requires_response=False) 
 
-            if response and response.get("e") == event_code_resp:
+            if response and response.get("e") in (event_code_req, event_code_resp):
                  candles_data = response.get("d")
-                 if isinstance(candles_data, list):
+                 if isinstance(candles_data, list) and len(candles_data) > 0:
+                     if isinstance(candles_data[0], dict) and "candles" in candles_data[0]:
+                         candles_list = candles_data[0]["candles"]
+                         logger.info(f"Received {len(candles_list)} candles for {pair}.")
+                         return candles_list[-count:] if count else candles_list
                      logger.info(f"Received {len(candles_data)} candles for {pair}.")
-                     # TODO: Validate candle format [{p, t, open, low, high, close}, ...]
-                     return candles_data
+                     return candles_data[-count:] if count else candles_data
                  else:
                      logger.error(f"Unexpected data format in candle response: {candles_data}")
                      return None
             else:
-                 logger.error(f"Did not receive expected candle response (e:{event_code_resp}). Got: {response}")
+                 logger.error(f"Did not receive expected candle response. Got: {response}")
                  return None
 
         except Exception as e:
