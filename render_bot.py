@@ -28,9 +28,7 @@ LOOKBACK_CANDLES = 10          # Number of 5s candles for baseline
 INVERT_SIGNALS = True          # True: Surge UP -> BUY UP | Surge DOWN -> SELL DOWN
 
 # Risk Limits
-MAX_MARTINGALE_STEPS = int(os.environ.get("MAX_MARTINGALE_STEPS", 4))
-STOP_LOSS = float(os.environ.get("STOP_LOSS", 1500.0))
-TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT", 1000.0))
+MAX_MARTINGALE_STEPS = int(os.environ.get("MAX_MARTINGALE_STEPS", 6))
 DELAY_AFTER_TRADE = 3          # Buffer seconds before looking for next spike
 # =====================================================================
 
@@ -57,6 +55,7 @@ def get_token() -> str:
 class BotState:
     def __init__(self):
         self.status = "INITIALIZING"
+        self.is_running = True
         self.account_type = ACCOUNT_TYPE
         self.account_id = None
         self.starting_balance = 0.0
@@ -255,6 +254,75 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.4; transform: scale(0.9); }
     }
+    /* Control Panel & Buttons */
+    .control-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .control-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .control-title {
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+    .btn-group {
+      display: flex;
+      gap: 12px;
+    }
+    .btn {
+      font-family: 'Inter', sans-serif;
+      font-weight: 700;
+      font-size: 0.9rem;
+      padding: 10px 24px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+      letter-spacing: 0.5px;
+    }
+    .btn-start {
+      background: #10b981;
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35);
+    }
+    .btn-start:hover:not(:disabled) {
+      background: #059669;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 18px rgba(16, 185, 129, 0.45);
+    }
+    .btn-stop {
+      background: #ef4444;
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(239, 68, 68, 0.35);
+    }
+    .btn-stop:hover:not(:disabled) {
+      background: #dc2626;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 18px rgba(239, 68, 68, 0.45);
+    }
+    .btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+      transform: none !important;
+      box-shadow: none !important;
+    }
+    .badge-running { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
+    .badge-paused { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
+
     footer {
       text-align: center;
       margin-top: 32px;
@@ -276,6 +344,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="badge" style="background:#1f2937; color:#9ca3af;">UPTIME: <span id="uptime">0m</span></span>
       </div>
     </header>
+
+    <!-- Interactive Bot Controls -->
+    <div class="control-panel">
+      <div class="control-info">
+        <span class="control-title">BOT TRADING STATUS:</span>
+        <span class="badge badge-running" id="trading-state-badge">🟢 TRADING ACTIVE</span>
+      </div>
+      <div class="btn-group">
+        <button id="btn-start" onclick="setBotTrading(true)" class="btn btn-start" disabled>▶ START BOT</button>
+        <button id="btn-stop" onclick="setBotTrading(false)" class="btn btn-stop">⏹ STOP BOT</button>
+      </div>
+    </div>
 
     <!-- Strategy Summary -->
     <div class="strategy-banner">
@@ -350,6 +430,41 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <script>
+    async function setBotTrading(start) {
+      const endpoint = start ? '/api/start' : '/api/stop';
+      const btnStart = document.getElementById('btn-start');
+      const btnStop = document.getElementById('btn-stop');
+      btnStart.disabled = true;
+      btnStop.disabled = true;
+      try {
+        const res = await fetch(endpoint);
+        const data = await res.json();
+        updateTradingUI(data.is_running);
+      } catch (err) {
+        alert("Control error: " + err);
+      } finally {
+        setTimeout(fetchStats, 500);
+      }
+    }
+
+    function updateTradingUI(isRunning) {
+      const badge = document.getElementById('trading-state-badge');
+      const btnStart = document.getElementById('btn-start');
+      const btnStop = document.getElementById('btn-stop');
+
+      if (isRunning) {
+        badge.textContent = "🟢 TRADING ACTIVE";
+        badge.className = "badge badge-running";
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+      } else {
+        badge.textContent = "⏸️ PAUSED / IDLE";
+        badge.className = "badge badge-paused";
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+      }
+    }
+
     function formatMoney(val) {
       const sign = val >= 0 ? '+' : '';
       return sign + '$' + Number(val).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
@@ -375,6 +490,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('bot-status').textContent = data.status;
         document.getElementById('account-id').textContent = data.account_id || '---';
         document.getElementById('uptime').textContent = formatUptime(data.uptime);
+        updateTradingUI(data.is_running);
         
         const badge = document.getElementById('account-badge');
         badge.textContent = data.account_type.toUpperCase();
@@ -450,7 +566,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'OK')
             return
 
-        # 2. Status API for Dashboard live updates
+        # 2. Start / Stop Control Endpoints
+        elif self.path in ('/api/start', '/api/stop'):
+            if self.path == '/api/start':
+                state.is_running = True
+                state.status = "SCANNING_MARKET"
+                print("▶️ Bot STARTED by user via dashboard.")
+            else:
+                state.is_running = False
+                state.status = "PAUSED_BY_USER"
+                print("⏸️ Bot STOPPED by user via dashboard.")
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "success": True,
+                "is_running": state.is_running,
+                "status": state.status
+            }).encode('utf-8'))
+            return
+
+        # 3. Status API for Dashboard live updates
         elif self.path == '/api/status':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -462,6 +600,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             payload = {
                 "status": state.status,
+                "is_running": state.is_running,
                 "account_type": state.account_type,
                 "account_id": state.account_id,
                 "starting_balance": state.starting_balance,
@@ -554,7 +693,7 @@ class CloudTrader:
                 self.current_bucket = bucket
                 self.current_candle = {"open": price, "high": price, "low": price, "close": price, "time": bucket}
 
-                if not self.is_trading:
+                if not self.is_trading and state.is_running:
                     signal = self.check_setup(closed)
                     if signal:
                         self._active_signal = signal
@@ -641,15 +780,11 @@ class CloudTrader:
 
         round_num = 1
         while True:
-            # Risk Stops
-            if state.net_session_pnl <= -STOP_LOSS:
-                state.status = "STOP_LOSS_HALT"
-                print(f"🛑 STOP-LOSS HIT (-${abs(state.net_session_pnl):.2f})!")
-                break
-            if state.net_session_pnl >= TAKE_PROFIT:
-                state.status = "TAKE_PROFIT_HALT"
-                print(f"🎉 TAKE-PROFIT HIT (+${state.net_session_pnl:.2f})!")
-                break
+            # Check pause status
+            if not state.is_running:
+                state.status = "PAUSED_BY_USER"
+                await asyncio.sleep(1)
+                continue
 
             # Martingale Max Step Reset
             if state.martingale_step > MAX_MARTINGALE_STEPS:
@@ -659,8 +794,16 @@ class CloudTrader:
                 state.cumulative_cycle_loss = 0.0
 
             self._signal_event.clear()
-            state.status = "SCANNING_MARKET"
-            await self._signal_event.wait()
+            if state.status != "PAUSED_BY_USER":
+                state.status = "SCANNING_MARKET"
+            
+            try:
+                await asyncio.wait_for(self._signal_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            if not state.is_running:
+                continue
 
             signal = self._active_signal
             self._active_signal = None
