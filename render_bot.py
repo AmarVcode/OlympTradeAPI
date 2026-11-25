@@ -43,6 +43,22 @@ FOREX_PAIRS = [
     "EURCAD", "EURCHF", "GBPCHF", "GBPAUD", "GBPCAD", "AUDCAD", "AUDNZD",
     "CADCHF", "EURNZD", "GBPNZD", "NZDCAD", "NZDCHF", "NZDJPY"
 ]
+
+# Non-OTC Crypto Pairs to monitor (24/7 Market)
+CRYPTO_PAIRS = [
+    "BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "SOLUSD", "ADAUSD",
+    "DOGEUSD", "DOTUSD", "AVAXUSD", "LINKUSD", "BNBUSD", "TRXUSD",
+    "BCHUSD", "ATOMUSD", "MATICUSD"
+]
+
+TARGET_ASSETS = FOREX_PAIRS + CRYPTO_PAIRS
+
+def is_valid_asset(pair: str) -> bool:
+    """Ensure pair is in allowed list and strictly NOT an OTC asset."""
+    p = pair.upper()
+    if "_OTC" in p or "OTC" in p or "_X" in p or "INDEX" in p:
+        return False
+    return p in TARGET_ASSETS or (len(p) == 6 and (p in FOREX_PAIRS or p in CRYPTO_PAIRS))
 # =====================================================================
 
 def get_token() -> str:
@@ -271,7 +287,9 @@ class BotState:
         self.cumulative_cycle_loss = 0.0
 
         # Market & Signal State
-        self.active_forex_pair = "EURUSD"
+        self.active_pair = "EURUSD"
+        self.active_forex_pair = "EURUSD"           # Backwards compatibility alias
+        self.active_asset_type = "FOREX"            # "FOREX" or "CRYPTO"
         self.active_payout = 0.82
         self.eligible_pairs: List[Dict[str, Any]] = []
         self.supertrend_direction = "UNKNOWN"       # "UPTREND" or "DOWNTREND"
@@ -490,7 +508,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="container">
     <header>
       <div class="logo-box">
-        <h1>📊 OlympTrade Forex Trend Bot</h1>
+        <h1>📊 OlympTrade Forex & Crypto Trend Bot</h1>
       </div>
       <div class="badges">
         <span class="badge badge-status"><span class="pulse-dot"></span><span id="bot-status">RUNNING</span></span>
@@ -517,12 +535,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div>
         <div class="strategy-title">🎯 Supertrend (10, 3.0) + LuxAlgo Echo Forecast (50, 50)</div>
         <div class="strategy-desc">
-          Only Real Forex Pairs (No OTC) · Payout &ge; 80% · Durations: 8m &rarr; 16m &rarr; 32m &rarr; Max 3 Losses Stop
+          Real Forex & Crypto Pairs (No OTC) · Payout &ge; 80% · Durations: 8m &rarr; 16m &rarr; 32m &rarr; Max 3 Losses Stop
         </div>
         <div style="margin-top: 8px;">
           <span class="indicator-pill">Supertrend: <strong id="ind-supertrend" style="color:#60a5fa;">SCANNING</strong></span>
           <span class="indicator-pill">Echo Forecast: <strong id="ind-echo" style="color:#a78bfa;">SCANNING</strong></span>
-          <span class="indicator-pill">Pair: <strong id="active-pair" style="color:#34d399;">EURUSD</strong> (<span id="pair-payout">82%</span>)</span>
+          <span class="indicator-pill">Pair: <strong id="active-pair" style="color:#34d399;">EURUSD</strong> (<span id="pair-payout">82%</span>) [<span id="asset-type" style="color:#f59e0b;">FOREX</span>]</span>
         </div>
       </div>
       <div style="font-family:'JetBrains Mono'; font-size:0.85rem; text-align:right;">
@@ -690,7 +708,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const durMins = Math.round(data.current_duration_seconds / 60);
         document.getElementById('next-duration').textContent = `${durMins} min`;
 
-        document.getElementById('active-pair').textContent = data.active_forex_pair;
+        document.getElementById('active-pair').textContent = data.active_pair || data.active_forex_pair || 'EURUSD';
+        document.getElementById('asset-type').textContent = data.active_asset_type || 'FOREX';
         document.getElementById('pair-payout').textContent = Math.round((data.active_payout || 0.8) * 100) + '%';
         
         const stEl = document.getElementById('ind-supertrend');
@@ -805,7 +824,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "max_consecutive_losses": state.max_consecutive_losses,
                 "current_bet": state.current_bet,
                 "current_duration_seconds": state.current_duration_seconds,
-                "active_forex_pair": state.active_forex_pair,
+                "active_pair": state.active_pair,
+                "active_forex_pair": state.active_pair,
+                "active_asset_type": state.active_asset_type,
                 "active_payout": state.active_payout,
                 "supertrend_direction": state.supertrend_direction,
                 "echo_direction": state.echo_direction,
@@ -855,8 +876,8 @@ class ForexTrader:
         needed = (state.cumulative_cycle_loss + target_profit) / payout
         return round(needed, 1)
 
-    async def update_eligible_forex_pairs(self):
-        """Filters non-OTC Forex pairs with profitability >= 80%."""
+    async def update_eligible_assets(self):
+        """Filters non-OTC Forex & Crypto pairs with profitability >= 80%."""
         try:
             p_data = await self.client.market.get_profitability(state.account_id)
             if p_data and isinstance(p_data, list):
@@ -867,23 +888,28 @@ class ForexTrader:
                         continue
                     # Convert to decimal payout
                     payout_dec = float(val) / 100.0 if float(val) > 1.0 else float(val)
-                    self.payout_cache[str(pair_name)] = payout_dec
+                    self.payout_cache[str(pair_name).upper()] = payout_dec
         except Exception as e:
             print(f"⚠️ Note on profitability check: {e}")
 
-        # Filter standard Forex pairs (No OTC, no synthetic indices)
+        # Filter standard Forex & Crypto pairs (Strictly Non-OTC)
         eligible = []
-        for pair in FOREX_PAIRS:
-            # Payout defaults to 82% during open forex hours if not cached
-            payout = self.payout_cache.get(pair, 0.82)
+        for pair in TARGET_ASSETS:
+            if not is_valid_asset(pair):
+                continue
+            # Payout defaults to 82% during open hours if not cached
+            payout = self.payout_cache.get(pair.upper(), 0.82)
             if payout >= MIN_PAYOUT_RATE:
-                eligible.append({"pair": pair, "payout": payout})
+                asset_type = "CRYPTO" if pair in CRYPTO_PAIRS else "FOREX"
+                eligible.append({"pair": pair, "payout": payout, "type": asset_type})
 
         # Sort highest payout first
         eligible.sort(key=lambda x: x["payout"], reverse=True)
         state.eligible_pairs = eligible
         if eligible:
+            state.active_pair = eligible[0]["pair"]
             state.active_forex_pair = eligible[0]["pair"]
+            state.active_asset_type = eligible[0].get("type", "FOREX")
             state.active_payout = eligible[0]["payout"]
 
     async def scan_for_signal(self, pair: str) -> Optional[str]:
@@ -986,12 +1012,21 @@ class ForexTrader:
         state.status = "SCANNING_FOREX"
         print(f"✅ Connected to {ACCOUNT_TYPE.upper()} Account ID: {state.account_id} | Balance: ${state.starting_balance:,.2f}")
 
-        # Identify eligible Forex pairs with >= 80% payout
-        await self.update_eligible_forex_pairs()
-        print(f"🔍 Found {len(state.eligible_pairs)} eligible Forex pairs with >= 80% payout. Primary: {state.active_forex_pair}")
+        # Identify eligible Forex & Crypto pairs with >= 80% payout
+        await self.update_eligible_assets()
+        forex_count = sum(1 for p in state.eligible_pairs if p.get("type") == "FOREX")
+        crypto_count = sum(1 for p in state.eligible_pairs if p.get("type") == "CRYPTO")
+        print(f"🔍 Found {len(state.eligible_pairs)} eligible non-OTC assets ({forex_count} Forex, {crypto_count} Crypto) with >= 80% payout. Primary: {state.active_pair}")
 
         round_num = 1
+        last_assets_refresh = time.time()
+
         while True:
+            # Periodically refresh asset payouts every 5 minutes
+            if time.time() - last_assets_refresh > 300:
+                await self.update_eligible_assets()
+                last_assets_refresh = time.time()
+
             # 1. Check if paused by user
             if not state.is_running:
                 if state.consecutive_losses < MAX_CONSECUTIVE_LOSSES:
@@ -1007,17 +1042,19 @@ class ForexTrader:
                 await asyncio.sleep(2)
                 continue
 
-            state.status = "SCANNING_FOREX"
+            state.status = "SCANNING_MARKET"
 
-            # Scan eligible Forex pairs for aligned Supertrend + Echo Forecast setup
-            candidate_pairs = [p["pair"] for p in state.eligible_pairs[:5]] if state.eligible_pairs else [state.active_forex_pair]
+            # Scan eligible Forex & Crypto pairs for aligned Supertrend + Echo Forecast setup
+            candidate_pairs = [p["pair"] for p in state.eligible_pairs[:6]] if state.eligible_pairs else [state.active_pair]
             signal_found = None
-            selected_pair = state.active_forex_pair
+            selected_pair = state.active_pair
 
             for pair in candidate_pairs:
                 if not state.is_running:
                     break
+                state.active_pair = pair
                 state.active_forex_pair = pair
+                state.active_asset_type = "CRYPTO" if pair in CRYPTO_PAIRS else "FOREX"
                 sig = await self.scan_for_signal(pair)
                 if sig:
                     signal_found = sig

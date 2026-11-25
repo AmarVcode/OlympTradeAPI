@@ -2,7 +2,7 @@
 =====================================================================
 🚀 OLYMPTRADE DEMO TRADING BOT LAUNCHER
 Strategy: Supertrend (10, 3.0) + LuxAlgo Echo Forecast (50, 50)
-Target: Non-OTC Forex Pairs (Payout >= 80%)
+Target: Real Forex & Crypto Pairs (Payout >= 80%, No OTC)
 Durations: 8 min -> 16 min -> 32 min -> Stop at 3 Consecutive Losses
 =====================================================================
 """
@@ -30,7 +30,7 @@ def main():
     print(f"• Trade Durations   : 8m (Step 1) -> 16m (Step 2) -> 32m (Step 3)")
     print(f"• Max Loss Limit    : Stop completely after 3 consecutive losses")
     print(f"• Strategy          : Supertrend (10, 3.0) + LuxAlgo Echo Forecast (50, 50)")
-    print(f"• Assets Filter     : Real Forex Pairs Only (No OTC) with Payout >= 80%")
+    print(f"• Assets Filter     : Real Forex & Crypto Pairs (No OTC) with Payout >= 80%")
     print(f"• Local Dashboard   : http://localhost:{PORT}")
     print("=" * 65)
 
