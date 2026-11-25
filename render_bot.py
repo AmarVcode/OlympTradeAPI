@@ -3,33 +3,46 @@ import os
 import sys
 import time
 import json
+import math
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
-from typing import Optional, Dict, Any, Deque, List
+from typing import Optional, Dict, Any, Deque, List, Tuple
 from olymptrade_ws import OlympTradeClient
 
 # =====================================================================
-# ⚙️ ONRENDER 24/7 CONFIGURATION
+# ⚙️ CONFIGURATION & SETTINGS
 # =====================================================================
 PORT = int(os.environ.get("PORT", 10000))
-ACCOUNT_TYPE = os.environ.get("ACCOUNT_TYPE", "real").lower() # "real" or "demo"
+ACCOUNT_TYPE = os.environ.get("ACCOUNT_TYPE", "demo").lower() # "real" or "demo"
 BASE_AMOUNT = float(os.environ.get("BASE_AMOUNT", 70.0))     # Starting bet ($70)
-PAYOUT_RATE = 0.85                                            # Quickler payout rate (85%)
-ASSET_PAIR = "ULTRA_X"                                        # Quickler 5-second ticker
-TRADE_DURATION = 5                                            # 5 seconds
-CANDLE_TIMEFRAME = 5                                          # 5-second candle construction
+MIN_PAYOUT_RATE = 0.80                                       # Minimum 80% payout required
 
-# Setup Parameters (Inverted Momentum Continuation)
-SPIKE_MULTIPLIER = 2.5         # Spike body >= 2.5x avg baseline
-MIN_BODY_RATIO = 0.65          # Marubozu surge ratio >= 65%
-LOOKBACK_CANDLES = 10          # Number of 5s candles for baseline
-INVERT_SIGNALS = True          # True: Surge UP -> BUY UP | Surge DOWN -> SELL DOWN
+# Duration Progression: 8m -> 16m -> 32m -> Stop
+DURATIONS = [8 * 60, 16 * 60, 32 * 60]                       # [480s, 960s, 1920s]
+MAX_CONSECUTIVE_LOSSES = 3                                   # Stop after 3 consecutive losses
+CANDLE_TIMEFRAME = 60                                        # 1-minute candle construction (60s)
+CANDLE_HISTORY_COUNT = 160                                   # 160 candles needed for Echo Forecast
 
-# Risk Limits
-MAX_MARTINGALE_STEPS = int(os.environ.get("MAX_MARTINGALE_STEPS", 6))
-DELAY_AFTER_TRADE = 3          # Buffer seconds before looking for next spike
+# Indicator Parameters (from TradingView Pine Scripts)
+# 1. Supertrend (TradingView built-in)
+SUPERTREND_ATR_PERIOD = 10
+SUPERTREND_FACTOR = 3.0
+
+# 2. The Echo Forecast [LuxAlgo]
+ECHO_EVAL_LENGTH = 50                                        # Evaluation Window
+ECHO_FCAST_WINDOW = 50                                       # Forecast Window
+ECHO_FMODE = "Similarity"                                    # 'Similarity' or 'Dissimilarity'
+ECHO_CMODE = "Cumulative"                                    # 'Cumulative' or 'Mean'
+
+# Non-OTC Forex Pairs to monitor
+FOREX_PAIRS = [
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+    "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY", "CHFJPY", "EURAUD",
+    "EURCAD", "EURCHF", "GBPCHF", "GBPAUD", "GBPCAD", "AUDCAD", "AUDNZD",
+    "CADCHF", "EURNZD", "GBPNZD", "NZDCAD", "NZDCHF", "NZDJPY"
+]
 # =====================================================================
 
 def get_token() -> str:
@@ -51,7 +64,181 @@ def get_token() -> str:
     print("[!] No access token found. Please set OLYMP_ACCESS_TOKEN.")
     sys.exit(1)
 
-# Global State Container for Dashboard & UptimeRobot
+# =====================================================================
+# 📈 TECHNICAL INDICATORS (Supertrend + LuxAlgo Echo Forecast)
+# =====================================================================
+def calculate_supertrend(candles: List[Dict[str, float]], atr_period: int = 10, factor: float = 3.0) -> Tuple[Optional[float], Optional[int]]:
+    """
+    Exact Pine Script ta.supertrend(factor, atrPeriod) implementation.
+    Returns: (supertrend_value, direction)
+    direction: -1 = Uptrend (Bullish/Green), 1 = Downtrend (Bearish/Red)
+    """
+    n = len(candles)
+    if n < atr_period + 1:
+        return None, None
+
+    # 1. True Range (TR)
+    trs = []
+    for i in range(n):
+        h = candles[i]['high']
+        l = candles[i]['low']
+        if i == 0:
+            trs.append(h - l)
+        else:
+            prev_c = candles[i - 1]['close']
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+
+    # 2. Wilder's RMA Smoothing for ATR
+    atrs = [0.0] * n
+    atrs[atr_period - 1] = sum(trs[:atr_period]) / atr_period
+    for i in range(atr_period, n):
+        atrs[i] = (atrs[i - 1] * (atr_period - 1) + trs[i]) / atr_period
+
+    # 3. Supertrend Bands & Direction
+    upper_band = [0.0] * n
+    lower_band = [0.0] * n
+    supertrend = [0.0] * n
+    direction = [1] * n
+
+    for i in range(atr_period - 1, n):
+        hl2 = (candles[i]['high'] + candles[i]['low']) / 2.0
+        basic_upper = hl2 + factor * atrs[i]
+        basic_lower = hl2 - factor * atrs[i]
+
+        if i == atr_period - 1:
+            upper_band[i] = basic_upper
+            lower_band[i] = basic_lower
+            direction[i] = 1 if candles[i]['close'] < basic_upper else -1
+            supertrend[i] = upper_band[i] if direction[i] == 1 else lower_band[i]
+            continue
+
+        prev_close = candles[i - 1]['close']
+
+        # Upper band adjustment
+        if basic_upper < upper_band[i - 1] or prev_close > upper_band[i - 1]:
+            upper_band[i] = basic_upper
+        else:
+            upper_band[i] = upper_band[i - 1]
+
+        # Lower band adjustment
+        if basic_lower > lower_band[i - 1] or prev_close < lower_band[i - 1]:
+            lower_band[i] = basic_lower
+        else:
+            lower_band[i] = lower_band[i - 1]
+
+        # Direction logic matching Pine Script
+        if supertrend[i - 1] == upper_band[i - 1]:
+            direction[i] = -1 if candles[i]['close'] > upper_band[i] else 1
+        else:
+            direction[i] = 1 if candles[i]['close'] < lower_band[i] else -1
+
+        supertrend[i] = lower_band[i] if direction[i] == -1 else upper_band[i]
+
+    return supertrend[-1], direction[-1]
+
+
+def calculate_echo_forecast(
+    closes: List[float],
+    length: int = 50,
+    fcast: int = 50,
+    fmode: str = "Similarity",
+    cmode: str = "Cumulative"
+) -> Optional[Dict[str, Any]]:
+    """
+    Exact Pine Script LuxAlgo Echo Forecast implementation.
+    Matches lines 40-103 of indicator/theechoforecast.
+    """
+    total_needed = length + fcast * 2 + 1
+    if len(closes) < total_needed:
+        # Dynamically scale window if at least 60 candles are available
+        if len(closes) >= 60:
+            fcast = min(50, (len(closes) - 1) // 3)
+            length = fcast
+            total_needed = length + fcast * 2 + 1
+        else:
+            return None
+
+    # In Pine Script: src[0] is the latest bar, src[1] is 1 bar ago.
+    # A[i] = closes[-(1 + i)]
+    A = [closes[-(1 + i)] for i in range(fcast * 2 + length + 1)]
+
+    # d[i] = src[i] - src[i+1]
+    d = [closes[-(1 + i)] - closes[-(2 + i)] for i in range(len(closes) - 1)]
+
+    # Reference window: a = A.slice(0, fcast - 1)
+    a = A[0 : fcast - 1]
+
+    def mean(lst: List[float]) -> float:
+        return sum(lst) / len(lst)
+
+    def std_dev(lst: List[float], m: float) -> float:
+        var = sum((x - m) ** 2 for x in lst) / len(lst)
+        return math.sqrt(max(var, 1e-14))
+
+    def covariance(x: List[float], y: List[float], mx: float, my: float) -> float:
+        return sum((xi - mx) * (yi - my) for xi, yi in zip(x, y)) / len(x)
+
+    mean_a = mean(a)
+    std_a = std_dev(a, mean_a)
+
+    best_k = 0
+    best_val = None
+
+    # Find historical window with maximum Pearson correlation
+    for i in range(length):
+        b = A[fcast + i : fcast * 2 + i - 1]
+        mean_b = mean(b)
+        std_b = std_dev(b, mean_b)
+
+        cov = covariance(a, b, mean_a, mean_b)
+        r = cov / (std_a * std_b) if (std_a * std_b) != 0 else 0.0
+
+        if best_val is None:
+            best_val = r
+            best_k = i
+        else:
+            if fmode == "Similarity":
+                if r >= best_val:
+                    best_val = r
+                    best_k = i
+            else:
+                if r <= best_val:
+                    best_val = r
+                    best_k = i
+
+    # Generate the projected Echo trajectory
+    current = closes[-1]
+    forecast_points = []
+
+    for i in range(fcast):
+        idx = fcast + best_k + (fcast - i - 1)
+        e = d[idx]
+        if cmode == "Cumulative":
+            current += e
+        elif cmode == "Mean":
+            current = mean_a + e
+        forecast_points.append(current)
+
+    start_p = closes[-1]
+    final_p = forecast_points[-1]
+    proj_change = final_p - start_p
+    proj_pct = (proj_change / start_p) * 100 if start_p != 0 else 0.0
+
+    return {
+        "best_k": best_k,
+        "correlation": round(best_val or 0.0, 4),
+        "current_price": start_p,
+        "final_price": final_p,
+        "projected_change": proj_change,
+        "projected_pct": round(proj_pct, 4),
+        "direction": "up" if proj_change > 0 else "down",
+        "forecast_points": forecast_points
+    }
+
+# =====================================================================
+# 🌐 GLOBAL BOT STATE
+# =====================================================================
 class BotState:
     def __init__(self):
         self.status = "INITIALIZING"
@@ -62,42 +249,50 @@ class BotState:
         self.current_balance = 0.0
         self.start_time = time.time()
         self.last_ping_time = time.time()
-        
+
         # Performance Metrics
         self.total_trades = 0
         self.total_wins = 0
         self.total_losses = 0
         self.total_draws = 0
         self.net_session_pnl = 0.0
-        
-        # Streaks
-        self.current_streak_type = "None" # "WIN" or "LOSS"
+
+        # Streaks & Limits
+        self.current_streak_type = "None"
         self.current_streak_count = 0
+        self.consecutive_losses = 0               # Track consecutive losses (0 to 3)
+        self.max_consecutive_losses = MAX_CONSECUTIVE_LOSSES
         self.max_win_streak = 0
         self.max_loss_streak = 0
-        
-        # Martingale
+
+        # Martingale & Duration State
         self.current_bet = BASE_AMOUNT
-        self.martingale_step = 1
+        self.current_duration_seconds = DURATIONS[0] # Starts at 8m (480s)
         self.cumulative_cycle_loss = 0.0
-        
-        # Market & Candle State
-        self.latest_tick_price = 0.0
-        self.candles_analyzed = 0
+
+        # Market & Signal State
+        self.active_forex_pair = "EURUSD"
+        self.active_payout = 0.82
+        self.eligible_pairs: List[Dict[str, Any]] = []
+        self.supertrend_direction = "UNKNOWN"       # "UPTREND" or "DOWNTREND"
+        self.supertrend_value = 0.0
+        self.echo_direction = "UNKNOWN"             # "UP" or "DOWN"
+        self.echo_projection_pct = 0.0
+        self.echo_correlation = 0.0
+        self.last_setup_info = "Initializing market scan..."
         self.recent_trades: Deque[Dict[str, Any]] = deque(maxlen=20)
-        self.last_setup_info = "Waiting for market activity..."
 
 state = BotState()
 
 # =====================================================================
-# 🌐 WEB DASHBOARD HTTP SERVER
+# 🌐 HTML DASHBOARD
 # =====================================================================
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OlympTrade 24/7 Quickler Bot</title>
+  <title>OlympTrade Forex Bot (Supertrend + Echo Forecast)</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
@@ -123,8 +318,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       line-height: 1.5;
     }
     .container { max-width: 1100px; margin: 0 auto; }
-    
-    /* Header */
     header {
       display: flex;
       flex-wrap: wrap;
@@ -135,8 +328,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border-bottom: 1px solid var(--card-border);
       margin-bottom: 24px;
     }
-    .logo-box { display: flex; align-items: center; gap: 12px; }
-    .logo-box h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.5px; }
+    .logo-box h1 { font-size: 1.35rem; font-weight: 700; }
     .badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .badge {
       font-size: 0.75rem;
@@ -149,11 +341,72 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-live { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
     .badge-demo { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid #3b82f6; }
     .badge-status { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
-    
+
+    /* Control Panel */
+    .control-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .control-info { display: flex; align-items: center; gap: 12px; }
+    .btn-group { display: flex; gap: 12px; }
+    .btn {
+      font-family: 'Inter', sans-serif;
+      font-weight: 700;
+      font-size: 0.9rem;
+      padding: 10px 24px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+    }
+    .btn-start { background: #10b981; color: #fff; box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35); }
+    .btn-start:hover:not(:disabled) { background: #059669; }
+    .btn-stop { background: #ef4444; color: #fff; box-shadow: 0 4px 14px rgba(239, 68, 68, 0.35); }
+    .btn-stop:hover:not(:disabled) { background: #dc2626; }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .badge-running { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
+    .badge-paused { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
+    .badge-halted { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+
+    /* Strategy Banner */
+    .strategy-banner {
+      background: linear-gradient(135deg, rgba(139, 92, 246, 0.12), rgba(59, 130, 246, 0.08));
+      border: 1px solid rgba(139, 92, 246, 0.3);
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .strategy-title { font-weight: 700; font-size: 0.95rem; color: #c4b5fd; margin-bottom: 4px; }
+    .strategy-desc { font-size: 0.85rem; color: var(--muted); }
+    .indicator-pill {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      margin-right: 6px;
+    }
+
     /* Stats Grid */
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
       gap: 16px;
       margin-bottom: 24px;
     }
@@ -163,10 +416,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 12px;
       padding: 18px;
       position: relative;
-      overflow: hidden;
     }
     .card-label {
-      font-size: 0.75rem;
+      font-size: 0.72rem;
       color: var(--muted);
       text-transform: uppercase;
       font-weight: 600;
@@ -175,28 +427,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
     .card-val {
       font-family: 'JetBrains Mono', monospace;
-      font-size: 1.7rem;
+      font-size: 1.6rem;
       font-weight: 800;
     }
     .val-green { color: var(--green); text-shadow: 0 0 12px var(--green-glow); }
     .val-red { color: var(--red); text-shadow: 0 0 12px var(--red-glow); }
     .card-sub { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
-
-    /* Live Strategy Box */
-    .strategy-banner {
-      background: linear-gradient(135deg, rgba(139, 92, 246, 0.1), rgba(59, 130, 246, 0.05));
-      border: 1px solid rgba(139, 92, 246, 0.3);
-      border-radius: 12px;
-      padding: 16px 20px;
-      margin-bottom: 24px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-    }
-    .strategy-title { font-weight: 700; font-size: 0.95rem; color: #c4b5fd; }
-    .strategy-desc { font-size: 0.85rem; color: var(--muted); }
 
     /* Table */
     .section-title {
@@ -213,12 +449,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 12px;
       overflow-x: auto;
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.85rem;
-      text-align: left;
-    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; text-align: left; }
     th {
       background: rgba(255, 255, 255, 0.02);
       padding: 12px 16px;
@@ -238,8 +469,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-loss { color: var(--red); font-weight: 700; }
     .badge-dir-up { color: #34d399; font-weight: 700; }
     .badge-dir-down { color: #f87171; font-weight: 700; }
-
-    /* Pulse dot */
     .pulse-dot {
       display: inline-block;
       width: 8px;
@@ -254,101 +483,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.4; transform: scale(0.9); }
     }
-    /* Control Panel & Buttons */
-    .control-panel {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
-      padding: 16px 20px;
-      margin-bottom: 24px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 16px;
-    }
-    .control-info {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .control-title {
-      font-weight: 700;
-      font-size: 0.95rem;
-    }
-    .btn-group {
-      display: flex;
-      gap: 12px;
-    }
-    .btn {
-      font-family: 'Inter', sans-serif;
-      font-weight: 700;
-      font-size: 0.9rem;
-      padding: 10px 24px;
-      border-radius: 8px;
-      border: none;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      transition: all 0.2s ease;
-      letter-spacing: 0.5px;
-    }
-    .btn-start {
-      background: #10b981;
-      color: #ffffff;
-      box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35);
-    }
-    .btn-start:hover:not(:disabled) {
-      background: #059669;
-      transform: translateY(-1px);
-      box-shadow: 0 6px 18px rgba(16, 185, 129, 0.45);
-    }
-    .btn-stop {
-      background: #ef4444;
-      color: #ffffff;
-      box-shadow: 0 4px 14px rgba(239, 68, 68, 0.35);
-    }
-    .btn-stop:hover:not(:disabled) {
-      background: #dc2626;
-      transform: translateY(-1px);
-      box-shadow: 0 6px 18px rgba(239, 68, 68, 0.45);
-    }
-    .btn:disabled {
-      opacity: 0.35;
-      cursor: not-allowed;
-      transform: none !important;
-      box-shadow: none !important;
-    }
-    .badge-running { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
-    .badge-paused { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
-
-    footer {
-      text-align: center;
-      margin-top: 32px;
-      font-size: 0.75rem;
-      color: var(--muted);
-    }
+    footer { text-align: center; margin-top: 32px; font-size: 0.75rem; color: var(--muted); }
   </style>
 </head>
 <body>
   <div class="container">
     <header>
       <div class="logo-box">
-        <h1>⚡ OlympTrade 24/7 Quickler</h1>
+        <h1>📊 OlympTrade Forex Trend Bot</h1>
       </div>
       <div class="badges">
         <span class="badge badge-status"><span class="pulse-dot"></span><span id="bot-status">RUNNING</span></span>
-        <span class="badge" id="account-badge">REAL</span>
+        <span class="badge" id="account-badge">DEMO</span>
         <span class="badge" style="background:#1f2937; color:#9ca3af;">ID: <span id="account-id">---</span></span>
         <span class="badge" style="background:#1f2937; color:#9ca3af;">UPTIME: <span id="uptime">0m</span></span>
       </div>
     </header>
 
-    <!-- Interactive Bot Controls -->
+    <!-- Bot Control Panel -->
     <div class="control-panel">
       <div class="control-info">
-        <span class="control-title">BOT TRADING STATUS:</span>
+        <span style="font-weight:700; font-size:0.9rem;">TRADING CONTROL:</span>
         <span class="badge badge-running" id="trading-state-badge">🟢 TRADING ACTIVE</span>
       </div>
       <div class="btn-group">
@@ -357,20 +512,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Strategy Summary -->
+    <!-- Strategy & Indicators Banner -->
     <div class="strategy-banner">
       <div>
-        <div class="strategy-title">🎯 Setup A: Inverted Momentum Spike (5-Second Quickler)</div>
-        <div class="strategy-desc" id="strategy-desc">Surge UP &rarr; BUY UP | Surge DOWN &rarr; SELL DOWN | Martingale 85% True-Recovery</div>
+        <div class="strategy-title">🎯 Supertrend (10, 3.0) + LuxAlgo Echo Forecast (50, 50)</div>
+        <div class="strategy-desc">
+          Only Real Forex Pairs (No OTC) · Payout &ge; 80% · Durations: 8m &rarr; 16m &rarr; 32m &rarr; Max 3 Losses Stop
+        </div>
+        <div style="margin-top: 8px;">
+          <span class="indicator-pill">Supertrend: <strong id="ind-supertrend" style="color:#60a5fa;">SCANNING</strong></span>
+          <span class="indicator-pill">Echo Forecast: <strong id="ind-echo" style="color:#a78bfa;">SCANNING</strong></span>
+          <span class="indicator-pill">Pair: <strong id="active-pair" style="color:#34d399;">EURUSD</strong> (<span id="pair-payout">82%</span>)</span>
+        </div>
       </div>
-      <div style="font-family:'JetBrains Mono'; font-size:0.85rem; color:#a78bfa;">
-        Next Bet: <strong id="next-bet" style="color:#fff; font-size:1.05rem;">$70.00</strong> (Step <span id="martingale-step">1</span>)
+      <div style="font-family:'JetBrains Mono'; font-size:0.85rem; text-align:right;">
+        <div>Next Bet: <strong id="next-bet" style="color:#fff; font-size:1.15rem;">$70.00</strong></div>
+        <div style="color:var(--muted); margin-top:4px;">Duration: <strong id="next-duration" style="color:#38bdf8;">8 min</strong></div>
       </div>
     </div>
 
     <!-- Stats Grid -->
     <div class="grid">
-      <!-- Session Net PnL -->
+      <!-- Session Net Profit -->
       <div class="card">
         <div class="card-label">Session Net Profit</div>
         <div class="card-val" id="net-pnl">$0.00</div>
@@ -381,28 +544,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="card">
         <div class="card-label">Current Balance</div>
         <div class="card-val" id="curr-balance">$0.00</div>
-        <div class="card-sub" id="balance-sub">Target Acc: REAL</div>
+        <div class="card-sub" id="balance-sub">Account: DEMO</div>
       </div>
 
-      <!-- Win Rate -->
+      <!-- Consecutive Loss Limit Tracker -->
+      <div class="card">
+        <div class="card-label">Consecutive Losses (Max 3)</div>
+        <div class="card-val" id="consec-losses">0 / 3</div>
+        <div class="card-sub" id="consec-sub">Halt trigger at 3 consecutive losses</div>
+      </div>
+
+      <!-- Win Rate / Record -->
       <div class="card">
         <div class="card-label">Win Rate / Record</div>
         <div class="card-val" id="win-rate">0.0%</div>
         <div class="card-sub"><span id="record-wins">0</span>W - <span id="record-losses">0</span>L (<span id="total-trades">0</span> total)</div>
       </div>
-
-      <!-- Current Streak -->
-      <div class="card">
-        <div class="card-label">Current Streak</div>
-        <div class="card-val" id="current-streak">0</div>
-        <div class="card-sub">Best: <span id="max-win-streak" style="color:var(--green)">0W</span> | Max Drawdown: <span id="max-loss-streak" style="color:var(--red)">0L</span></div>
-      </div>
     </div>
 
     <!-- Recent Trades Table -->
     <div class="section-title">
-      <span>📋 Recent Trades (Last 20)</span>
-      <span style="font-size:0.75rem; color:var(--muted); font-weight:400;">Auto-refreshes live</span>
+      <span>📋 Recent Forex Trades (Last 20)</span>
+      <span style="font-size:0.75rem; color:var(--muted);">Auto-refreshes every 2s</span>
     </div>
     <div class="table-card">
       <table>
@@ -410,7 +573,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <tr>
             <th>Round</th>
             <th>Time</th>
+            <th>Pair</th>
             <th>Direction</th>
+            <th>Duration</th>
             <th>Bet</th>
             <th>Strike</th>
             <th>Close</th>
@@ -419,13 +584,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </tr>
         </thead>
         <tbody id="trades-body">
-          <tr><td colspan="8" style="text-align:center; color:var(--muted); padding:24px;">Waiting for first trade execution...</td></tr>
+          <tr><td colspan="10" style="text-align:center; color:var(--muted); padding:24px;">Waiting for first Forex trade setup...</td></tr>
         </tbody>
       </table>
     </div>
 
     <footer>
-      OlympTrade Automated Cloud Bot · Connected via Secure WebSockets · Auto-Ping Healthcheck Active
+      OlympTrade Automated Forex Cloud Bot · Supertrend + Echo Forecast Strategy · Auto-KeepAlive Active
     </footer>
   </div>
 
@@ -439,7 +604,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       try {
         const res = await fetch(endpoint);
         const data = await res.json();
-        updateTradingUI(data.is_running);
+        updateTradingUI(data.is_running, data.status);
       } catch (err) {
         alert("Control error: " + err);
       } finally {
@@ -447,12 +612,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
-    function updateTradingUI(isRunning) {
+    function updateTradingUI(isRunning, status) {
       const badge = document.getElementById('trading-state-badge');
       const btnStart = document.getElementById('btn-start');
       const btnStop = document.getElementById('btn-stop');
 
-      if (isRunning) {
+      if (status && status.includes('HALTED')) {
+        badge.textContent = "🛑 STOPPED (3 LOSS LIMIT)";
+        badge.className = "badge badge-halted";
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+      } else if (isRunning) {
         badge.textContent = "🟢 TRADING ACTIVE";
         badge.className = "badge badge-running";
         btnStart.disabled = true;
@@ -486,40 +656,50 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const res = await fetch('/api/status');
         const data = await res.json();
 
-        // Update Badges & Status
         document.getElementById('bot-status').textContent = data.status;
         document.getElementById('account-id').textContent = data.account_id || '---';
         document.getElementById('uptime').textContent = formatUptime(data.uptime);
-        updateTradingUI(data.is_running);
-        
+        updateTradingUI(data.is_running, data.status);
+
         const badge = document.getElementById('account-badge');
         badge.textContent = data.account_type.toUpperCase();
         badge.className = 'badge ' + (data.account_type === 'real' ? 'badge-live' : 'badge-demo');
 
-        // Update Balance & PnL
+        // PnL & Balance
         const pnlEl = document.getElementById('net-pnl');
         pnlEl.textContent = formatMoney(data.net_session_pnl);
         pnlEl.className = 'card-val ' + (data.net_session_pnl >= 0 ? 'val-green' : 'val-red');
         document.getElementById('pnl-sub').textContent = 'Starting: $' + Number(data.starting_balance).toLocaleString('en-US', {minimumFractionDigits:2});
-
         document.getElementById('curr-balance').textContent = '$' + Number(data.current_balance).toLocaleString('en-US', {minimumFractionDigits:2});
-        
+
+        // Consecutive Losses
+        const lossCount = data.consecutive_losses || 0;
+        const lossEl = document.getElementById('consec-losses');
+        lossEl.textContent = `${lossCount} / 3`;
+        lossEl.className = 'card-val ' + (lossCount >= 2 ? 'val-red' : (lossCount === 1 ? 'card-val' : 'val-green'));
+        document.getElementById('consec-sub').textContent = lossCount >= 3 ? 'Max loss limit reached! Trading stopped.' : `Step ${lossCount + 1} of 3`;
+
         // Record
         document.getElementById('win-rate').textContent = data.win_rate + '%';
         document.getElementById('record-wins').textContent = data.total_wins;
         document.getElementById('record-losses').textContent = data.total_losses;
         document.getElementById('total-trades').textContent = data.total_trades;
 
-        // Streaks
-        const streakEl = document.getElementById('current-streak');
-        streakEl.textContent = `${data.current_streak_count} ${data.current_streak_type}`;
-        streakEl.className = 'card-val ' + (data.current_streak_type === 'WIN' ? 'val-green' : (data.current_streak_type === 'LOSS' ? 'val-red' : ''));
-        document.getElementById('max-win-streak').textContent = data.max_win_streak + 'W';
-        document.getElementById('max-loss-streak').textContent = data.max_loss_streak + 'L';
-
-        // Martingale Next Bet
+        // Indicators & Next Trade
         document.getElementById('next-bet').textContent = '$' + Number(data.current_bet).toFixed(2);
-        document.getElementById('martingale-step').textContent = data.martingale_step;
+        const durMins = Math.round(data.current_duration_seconds / 60);
+        document.getElementById('next-duration').textContent = `${durMins} min`;
+
+        document.getElementById('active-pair').textContent = data.active_forex_pair;
+        document.getElementById('pair-payout').textContent = Math.round((data.active_payout || 0.8) * 100) + '%';
+        
+        const stEl = document.getElementById('ind-supertrend');
+        stEl.textContent = data.supertrend_direction;
+        stEl.style.color = data.supertrend_direction === 'UPTREND' ? '#34d399' : (data.supertrend_direction === 'DOWNTREND' ? '#f87171' : '#9ca3af');
+
+        const echoEl = document.getElementById('ind-echo');
+        echoEl.textContent = `${data.echo_direction} (${data.echo_projection_pct > 0 ? '+' : ''}${data.echo_projection_pct}%)`;
+        echoEl.style.color = data.echo_direction === 'UP' ? '#34d399' : (data.echo_direction === 'DOWN' ? '#f87171' : '#9ca3af');
 
         // Trades Table
         if (data.recent_trades && data.recent_trades.length > 0) {
@@ -529,10 +709,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const tr = document.createElement('tr');
             const isWin = t.status === 'win' || t.pnl > 0;
             const pnlFormatted = formatMoney(t.pnl);
+            const dur = Math.round((t.duration || 480) / 60);
             tr.innerHTML = `
               <td>#${t.round}</td>
               <td>${formatTime(t.time)}</td>
+              <td><strong>${t.pair || 'EURUSD'}</strong></td>
               <td><span class="${t.dir === 'up' ? 'badge-dir-up' : 'badge-dir-down'}">${t.dir.toUpperCase()}</span></td>
+              <td>${dur}m</td>
               <td>$${Number(t.amount).toFixed(2)}</td>
               <td>${t.strike}</td>
               <td>${t.close}</td>
@@ -547,18 +730,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
-    setInterval(fetchStats, 1500);
+    setInterval(fetchStats, 2000);
     fetchStats();
   </script>
 </body>
 </html>
 """
 
+# =====================================================================
+# 🌐 WEB DASHBOARD HTTP HANDLER
+# =====================================================================
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         state.last_ping_time = time.time()
-        
-        # 1. Healthcheck for UptimeRobot / Cron pings
+
         if self.path in ('/healthz', '/ping'):
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
@@ -566,11 +751,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'OK')
             return
 
-        # 2. Start / Stop Control Endpoints
         elif self.path in ('/api/start', '/api/stop'):
             if self.path == '/api/start':
                 state.is_running = True
-                state.status = "SCANNING_MARKET"
+                if state.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                    # User clicked start after halt: reset consecutive loss cycle
+                    state.consecutive_losses = 0
+                    state.current_bet = BASE_AMOUNT
+                    state.current_duration_seconds = DURATIONS[0]
+                    state.cumulative_cycle_loss = 0.0
+                state.status = "SCANNING_FOREX"
                 print("▶️ Bot STARTED by user via dashboard.")
             else:
                 state.is_running = False
@@ -588,13 +778,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }).encode('utf-8'))
             return
 
-        # 3. Status API for Dashboard live updates
         elif self.path == '/api/status':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            
+
             total = state.total_wins + state.total_losses
             winrate = round((state.total_wins / total * 100), 1) if total > 0 else 0.0
 
@@ -612,19 +801,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "total_draws": state.total_draws,
                 "win_rate": winrate,
                 "net_session_pnl": round(state.net_session_pnl, 2),
-                "current_streak_type": state.current_streak_type,
-                "current_streak_count": state.current_streak_count,
-                "max_win_streak": state.max_win_streak,
-                "max_loss_streak": state.max_loss_streak,
+                "consecutive_losses": state.consecutive_losses,
+                "max_consecutive_losses": state.max_consecutive_losses,
                 "current_bet": state.current_bet,
-                "martingale_step": state.martingale_step,
-                "recent_trades": list(state.recent_trades),
-                "last_setup_info": state.last_setup_info
+                "current_duration_seconds": state.current_duration_seconds,
+                "active_forex_pair": state.active_forex_pair,
+                "active_payout": state.active_payout,
+                "supertrend_direction": state.supertrend_direction,
+                "echo_direction": state.echo_direction,
+                "echo_projection_pct": state.echo_projection_pct,
+                "last_setup_info": state.last_setup_info,
+                "recent_trades": list(state.recent_trades)
             }
             self.wfile.write(json.dumps(payload).encode('utf-8'))
             return
 
-        # 3. Main Dashboard HTML Index
         else:
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -632,7 +823,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
 
     def log_message(self, format, *args):
-        # Suppress noisy HTTP access logs in console
         return
 
 def start_http_server():
@@ -641,9 +831,9 @@ def start_http_server():
     server.serve_forever()
 
 # =====================================================================
-# ⚡ 24/7 TRADING ENGINE
+# ⚡ 24/7 FOREX TRADING ENGINE
 # =====================================================================
-class CloudTrader:
+class ForexTrader:
     def __init__(self, token: str):
         self.token = token
         self.client = OlympTradeClient(
@@ -651,96 +841,109 @@ class CloudTrader:
             account_group=ACCOUNT_TYPE,
             log_raw_messages=False
         )
-        self.current_bucket: Optional[int] = None
-        self.current_candle: Optional[Dict[str, float]] = None
-        self.completed_candles: Deque[Dict[str, float]] = deque(maxlen=30)
-        
-        self.target_profit_per_cycle = round(BASE_AMOUNT * PAYOUT_RATE, 2)
+        self.is_trading = False
         self._pending_trade_id: Optional[int] = None
         self._trade_future: Optional[asyncio.Future] = None
-        self._signal_event = asyncio.Event()
-        self._active_signal: Optional[str] = None
-        self.is_trading = False
+        self.payout_cache: Dict[str, float] = {}
 
     def calculate_next_martingale_bet(self) -> float:
+        """Calculate recovery bet for 80%+ payout."""
+        payout = state.active_payout if state.active_payout >= 0.5 else 0.80
+        target_profit = BASE_AMOUNT * payout
         if state.cumulative_cycle_loss <= 0:
             return BASE_AMOUNT
-        needed = (state.cumulative_cycle_loss + self.target_profit_per_cycle) / PAYOUT_RATE
+        needed = (state.cumulative_cycle_loss + target_profit) / payout
         return round(needed, 1)
 
-    async def on_tick(self, message: Dict[str, Any]):
-        tick_list = message.get("d", [])
-        if not isinstance(tick_list, list):
-            return
+    async def update_eligible_forex_pairs(self):
+        """Filters non-OTC Forex pairs with profitability >= 80%."""
+        try:
+            p_data = await self.client.market.get_profitability(state.account_id)
+            if p_data and isinstance(p_data, list):
+                for item in p_data:
+                    pair_name = item.get("pair") or item.get("p") or item.get("name")
+                    val = item.get("value") or item.get("profit") or item.get("payout") or item.get("win")
+                    if not pair_name or val is None:
+                        continue
+                    # Convert to decimal payout
+                    payout_dec = float(val) / 100.0 if float(val) > 1.0 else float(val)
+                    self.payout_cache[str(pair_name)] = payout_dec
+        except Exception as e:
+            print(f"⚠️ Note on profitability check: {e}")
 
-        for tick in tick_list:
-            if tick.get("p") != ASSET_PAIR:
-                continue
+        # Filter standard Forex pairs (No OTC, no synthetic indices)
+        eligible = []
+        for pair in FOREX_PAIRS:
+            # Payout defaults to 82% during open forex hours if not cached
+            payout = self.payout_cache.get(pair, 0.82)
+            if payout >= MIN_PAYOUT_RATE:
+                eligible.append({"pair": pair, "payout": payout})
 
-            price = float(tick.get("q", 0.0))
-            ts = float(tick.get("t", time.time()))
-            state.latest_tick_price = price
-            bucket = int(ts // CANDLE_TIMEFRAME) * CANDLE_TIMEFRAME
+        # Sort highest payout first
+        eligible.sort(key=lambda x: x["payout"], reverse=True)
+        state.eligible_pairs = eligible
+        if eligible:
+            state.active_forex_pair = eligible[0]["pair"]
+            state.active_payout = eligible[0]["payout"]
 
-            if self.current_bucket is None:
-                self.current_bucket = bucket
-                self.current_candle = {"open": price, "high": price, "low": price, "close": price, "time": bucket}
-            elif bucket > self.current_bucket:
-                closed = self.current_candle.copy()
-                self.completed_candles.append(closed)
-                state.candles_analyzed = len(self.completed_candles)
-                
-                self.current_bucket = bucket
-                self.current_candle = {"open": price, "high": price, "low": price, "close": price, "time": bucket}
+    async def scan_for_signal(self, pair: str) -> Optional[str]:
+        """
+        Fetches 1m candles for pair and computes Supertrend + Echo Forecast.
+        Returns 'up', 'down', or None.
+        """
+        candles = await self.client.market.get_candles(
+            pair=pair,
+            size=CANDLE_TIMEFRAME,
+            count=CANDLE_HISTORY_COUNT
+        )
 
-                if not self.is_trading and state.is_running:
-                    signal = self.check_setup(closed)
-                    if signal:
-                        self._active_signal = signal
-                        self._signal_event.set()
-            else:
-                if price > self.current_candle["high"]: self.current_candle["high"] = price
-                if price < self.current_candle["low"]: self.current_candle["low"] = price
-                self.current_candle["close"] = price
-
-    def check_setup(self, last_candle: Dict[str, float]) -> Optional[str]:
-        if len(self.completed_candles) < LOOKBACK_CANDLES:
+        if not candles or len(candles) < 60:
             return None
 
-        baseline = list(self.completed_candles)[-LOOKBACK_CANDLES:-1]
-        bodies = [abs(c["close"] - c["open"]) for c in baseline]
-        avg_body = sum(bodies) / len(bodies) if bodies else 0.0001
-        if avg_body == 0: avg_body = 0.0001
+        # 1. Calculate Supertrend (10, 3.0)
+        st_val, st_dir = calculate_supertrend(candles, SUPERTREND_ATR_PERIOD, SUPERTREND_FACTOR)
+        if st_dir is None:
+            return None
+        
+        state.supertrend_value = round(st_val or 0.0, 5)
+        state.supertrend_direction = "UPTREND" if st_dir < 0 else "DOWNTREND"
 
-        spike_body = abs(last_candle["close"] - last_candle["open"])
-        spike_range = max(last_candle["high"] - last_candle["low"], 0.0001)
-
-        is_abnormal = spike_body >= (SPIKE_MULTIPLIER * avg_body)
-        is_strong_body = (spike_body / spike_range) >= MIN_BODY_RATIO
-
-        if not (is_abnormal and is_strong_body):
+        # 2. Calculate Echo Forecast [LuxAlgo] (50, 50)
+        closes = [float(c["close"]) for c in candles]
+        echo_res = calculate_echo_forecast(
+            closes=closes,
+            length=ECHO_EVAL_LENGTH,
+            fcast=ECHO_FCAST_WINDOW,
+            fmode=ECHO_FMODE,
+            cmode=ECHO_CMODE
+        )
+        if not echo_res:
             return None
 
-        swing_high = max(c["high"] for c in baseline)
-        swing_low = min(c["low"] for c in baseline)
+        state.echo_direction = echo_res["direction"].upper()
+        state.echo_projection_pct = echo_res["projected_pct"]
+        state.echo_correlation = echo_res["correlation"]
 
-        # Bullish Surge
-        if last_candle["close"] > last_candle["open"] and last_candle["high"] >= swing_high:
-            action = "up" if INVERT_SIGNALS else "down"
-            state.last_setup_info = f"Bullish Surge ({spike_body/avg_body:.1f}x) -> Enter {action.upper()}"
-            print(f"🚨 [SETUP DETECTED] Bullish Surge! Entering {action.upper()}")
-            return action
+        # 3. Combine Indicator Signals
+        # CALL (UP): Supertrend Uptrend (direction < 0) AND Echo Forecast is UP
+        if st_dir < 0 and echo_res["direction"] == "up":
+            state.last_setup_info = f"[{pair}] Supertrend UPTREND & Echo Forecast BULLISH (+{echo_res['projected_pct']}%)"
+            print(f"🎯 [DEMO SIGNAL ALIGNED - BUY UP] {state.last_setup_info}")
+            return "up"
 
-        # Bearish Surge
-        elif last_candle["close"] < last_candle["open"] and last_candle["low"] <= swing_low:
-            action = "down" if INVERT_SIGNALS else "up"
-            state.last_setup_info = f"Bearish Surge ({spike_body/avg_body:.1f}x) -> Enter {action.upper()}"
-            print(f"🚨 [SETUP DETECTED] Bearish Surge! Entering {action.upper()}")
-            return action
+        # PUT (DOWN): Supertrend Downtrend (direction > 0) AND Echo Forecast is DOWN
+        elif st_dir > 0 and echo_res["direction"] == "down":
+            state.last_setup_info = f"[{pair}] Supertrend DOWNTREND & Echo Forecast BEARISH ({echo_res['projected_pct']}%)"
+            print(f"🎯 [DEMO SIGNAL ALIGNED - SELL DOWN] {state.last_setup_info}")
+            return "down"
+
+        else:
+            print(f"👀 [DEMO SCAN {pair}] Supertrend: {state.supertrend_direction} ({st_val:.5f}) vs Echo: {state.echo_direction} ({echo_res['projected_pct']:+.2f}%, Corr: {echo_res['correlation']:.2f}) -> Waiting alignment")
 
         return None
 
     async def on_trade_closed(self, message: Dict[str, Any]):
+        """Event 26: Trade Closed Callback"""
         trade_data = message.get("d", [])
         if isinstance(trade_data, list) and len(trade_data) > 0:
             trade_info = trade_data[0]
@@ -750,11 +953,10 @@ class CloudTrader:
 
     async def start(self):
         state.status = "CONNECTING"
-        self.client.register_callback(1, self.on_tick)
         self.client.register_callback(26, self.on_trade_closed)
 
         await self.client.start()
-        
+
         # Balance & Account Info
         balance_info = await self.client.balance.get_balance(timeout=10.0)
         target_acc = None
@@ -764,6 +966,15 @@ class CloudTrader:
                     target_acc = acc
                     break
 
+        if not target_acc and self.client._latest_balance and 'd' in self.client._latest_balance:
+            for acc in self.client._latest_balance['d']:
+                if acc.get('group') == ACCOUNT_TYPE:
+                    target_acc = acc
+                    break
+
+        if not target_acc and self.client.account_id:
+            target_acc = {'account_id': self.client.account_id, 'amount': 10000.0, 'group': ACCOUNT_TYPE}
+
         if not target_acc:
             state.status = "ERROR_NO_ACCOUNT"
             print(f"❌ Error: Account type '{ACCOUNT_TYPE}' not found.")
@@ -772,66 +983,82 @@ class CloudTrader:
         state.account_id = target_acc['account_id']
         state.starting_balance = float(target_acc.get('amount', 0.0))
         state.current_balance = state.starting_balance
-        state.status = "SCANNING_MARKET"
+        state.status = "SCANNING_FOREX"
         print(f"✅ Connected to {ACCOUNT_TYPE.upper()} Account ID: {state.account_id} | Balance: ${state.starting_balance:,.2f}")
 
-        # Subscribe to ticks
-        await self.client.market.subscribe_ticks(ASSET_PAIR)
+        # Identify eligible Forex pairs with >= 80% payout
+        await self.update_eligible_forex_pairs()
+        print(f"🔍 Found {len(state.eligible_pairs)} eligible Forex pairs with >= 80% payout. Primary: {state.active_forex_pair}")
 
         round_num = 1
         while True:
-            # Check pause status
+            # 1. Check if paused by user
             if not state.is_running:
-                state.status = "PAUSED_BY_USER"
+                if state.consecutive_losses < MAX_CONSECUTIVE_LOSSES:
+                    state.status = "PAUSED_BY_USER"
                 await asyncio.sleep(1)
                 continue
 
-            # Martingale Max Step Reset
-            if state.martingale_step > MAX_MARTINGALE_STEPS:
-                print(f"⚠️ Max Martingale Steps ({MAX_MARTINGALE_STEPS}) reached! Resetting.")
-                state.current_bet = BASE_AMOUNT
-                state.martingale_step = 1
-                state.cumulative_cycle_loss = 0.0
-
-            self._signal_event.clear()
-            if state.status != "PAUSED_BY_USER":
-                state.status = "SCANNING_MARKET"
-            
-            try:
-                await asyncio.wait_for(self._signal_event.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
+            # 2. Check Max Consecutive Losses Limit
+            if state.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                state.status = "HALTED: MAX 3 CONSECUTIVE LOSSES REACHED"
+                state.is_running = False
+                print(f"🛑 [STOP TRIGGERED] Bot halted after {state.consecutive_losses} consecutive losses! Trading stopped.")
+                await asyncio.sleep(2)
                 continue
 
-            if not state.is_running:
-                continue
+            state.status = "SCANNING_FOREX"
 
-            signal = self._active_signal
-            self._active_signal = None
+            # Scan eligible Forex pairs for aligned Supertrend + Echo Forecast setup
+            candidate_pairs = [p["pair"] for p in state.eligible_pairs[:5]] if state.eligible_pairs else [state.active_forex_pair]
+            signal_found = None
+            selected_pair = state.active_forex_pair
 
-            if signal:
+            for pair in candidate_pairs:
+                if not state.is_running:
+                    break
+                state.active_forex_pair = pair
+                sig = await self.scan_for_signal(pair)
+                if sig:
+                    signal_found = sig
+                    selected_pair = pair
+                    break
+                # Short pause between scanning pairs
+                await asyncio.sleep(1.0)
+
+            if signal_found and state.is_running and state.consecutive_losses < MAX_CONSECUTIVE_LOSSES:
                 self.is_trading = True
                 state.status = "TRADE_IN_PROGRESS"
-                await self.execute_trade(round_num, signal)
+                await self.execute_trade(round_num, selected_pair, signal_found)
                 round_num += 1
                 self.is_trading = False
                 state.status = "COOLING_DOWN"
-                await asyncio.sleep(DELAY_AFTER_TRADE)
+                await asyncio.sleep(5)
+            else:
+                # Wait before next candle scan cycle (15s)
+                await asyncio.sleep(15)
 
-    async def execute_trade(self, round_num: int, direction: str):
+    async def execute_trade(self, round_num: int, pair: str, direction: str):
+        duration = state.current_duration_seconds
+        amount = state.current_bet
+
+        dur_mins = round(duration / 60)
+        print(f"\n🚀 [EXECUTING TRADE #{round_num}] Pair: {pair} | Dir: {direction.upper()} | Bet: ${amount:.2f} | Duration: {dur_mins}m ({duration}s)")
+
         loop = asyncio.get_running_loop()
         self._trade_future = loop.create_future()
 
         order_res = await self.client.trade.place_order(
-            pair=ASSET_PAIR,
-            amount=state.current_bet,
+            pair=pair,
+            amount=amount,
             direction=direction,
-            duration=TRADE_DURATION,
+            duration=duration,
             account_id=state.account_id,
             group=ACCOUNT_TYPE
         )
 
         if not order_res or not order_res.get("id"):
-            print(f"❌ Failed to place trade: {order_res}")
+            print(f"❌ Failed to place trade on {pair}: {order_res}")
             return
 
         trade_id = order_res["id"]
@@ -839,27 +1066,45 @@ class CloudTrader:
         strike = order_res.get("curs_strike", 0.0)
 
         try:
-            trade_closed = await asyncio.wait_for(self._trade_future, timeout=12.0)
-            self.process_trade_result(round_num, direction, state.current_bet, strike, trade_closed)
+            # Wait for trade to close (duration + 60s buffer for broker callback)
+            timeout = duration + 60.0
+            print(f"⏳ Trade #{round_num} open (ID: {trade_id}). Waiting for {dur_mins}m expiry...")
+            trade_closed = await asyncio.wait_for(self._trade_future, timeout=timeout)
+            self.process_trade_result(round_num, pair, direction, amount, strike, duration, trade_closed)
         except asyncio.TimeoutError:
-            print("⚠️ Timeout waiting for trade closure event.")
+            print(f"⚠️ Timeout waiting for trade closure event after {dur_mins}m.")
         finally:
             self._pending_trade_id = None
             self._trade_future = None
 
-    def process_trade_result(self, round_num: int, direction: str, amount: float, strike: float, info: Dict[str, Any]):
+    def process_trade_result(
+        self,
+        round_num: int,
+        pair: str,
+        direction: str,
+        amount: float,
+        strike: float,
+        duration: int,
+        info: Dict[str, Any]
+    ):
         status = info.get("status", "").lower()
         balance_change = float(info.get("balance_change", 0.0))
         close_p = float(info.get("curs_close", 0.0))
 
         state.total_trades += 1
 
-        # WIN
+        # ----------------- WIN -----------------
         if status == "win" or balance_change > 0:
             profit = balance_change
             state.net_session_pnl += profit
             state.current_balance += profit
             state.total_wins += 1
+
+            # Reset consecutive losses and restore defaults
+            state.consecutive_losses = 0
+            state.current_bet = BASE_AMOUNT
+            state.current_duration_seconds = DURATIONS[0] # Reset to 8m (480s)
+            state.cumulative_cycle_loss = 0.0
 
             if state.current_streak_type == "WIN":
                 state.current_streak_count += 1
@@ -869,15 +1114,15 @@ class CloudTrader:
             if state.current_streak_count > state.max_win_streak:
                 state.max_win_streak = state.current_streak_count
 
-            print(f"✅ WIN (+${profit:.2f}) | Resetting to ${BASE_AMOUNT:.2f}")
-            state.current_bet = BASE_AMOUNT
-            state.martingale_step = 1
-            state.cumulative_cycle_loss = 0.0
+            print(f"\n🎉 [TRADE #{round_num} WIN] Profit: +${profit:.2f}!")
+            print(f"🔄 Everything RESET: Trade Amount -> ${BASE_AMOUNT:.2f} | Duration -> 8m (480s) | Consecutive Losses -> 0")
 
             state.recent_trades.appendleft({
                 "round": round_num,
                 "time": time.time(),
+                "pair": pair,
                 "dir": direction,
+                "duration": duration,
                 "amount": amount,
                 "strike": strike,
                 "close": close_p,
@@ -885,12 +1130,14 @@ class CloudTrader:
                 "pnl": profit
             })
 
-        # LOSS
+        # ----------------- LOSS -----------------
         elif status in ["loose", "loss"] or balance_change < 0:
             loss = amount
             state.net_session_pnl -= loss
             state.current_balance -= loss
             state.total_losses += 1
+            state.consecutive_losses += 1
+            state.cumulative_cycle_loss += loss
 
             if state.current_streak_type == "LOSS":
                 state.current_streak_count += 1
@@ -900,17 +1147,33 @@ class CloudTrader:
             if state.current_streak_count > state.max_loss_streak:
                 state.max_loss_streak = state.current_streak_count
 
-            state.cumulative_cycle_loss += loss
-            state.martingale_step += 1
-            next_bet = self.calculate_next_martingale_bet()
-            state.current_bet = next_bet
+            print(f"\n❌ [TRADE #{round_num} LOSS] Loss: -${loss:.2f}! (Consecutive Losses: {state.consecutive_losses} / {MAX_CONSECUTIVE_LOSSES})")
 
-            print(f"❌ LOSS (-${loss:.2f}) | Martingale Step {state.martingale_step} -> Next Bet: ${next_bet:.2f}")
+            # Check Progression Steps
+            if state.consecutive_losses == 1:
+                # Next trade: 16 minutes (960s)
+                state.current_duration_seconds = DURATIONS[1] # 16m
+                state.current_bet = self.calculate_next_martingale_bet()
+                print(f"➡️ [STEP 2] Loss 1: Next Duration -> 16m (960s) | Next Bet -> ${state.current_bet:.2f}")
+
+            elif state.consecutive_losses == 2:
+                # Next trade: 32 minutes (1920s)
+                state.current_duration_seconds = DURATIONS[2] # 32m
+                state.current_bet = self.calculate_next_martingale_bet()
+                print(f"➡️ [STEP 3] Loss 2: Next Duration -> 32m (1920s) | Next Bet -> ${state.current_bet:.2f}")
+
+            elif state.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                # 3 Consecutive Losses -> STOP TRADING!
+                state.is_running = False
+                state.status = "HALTED: MAX 3 CONSECUTIVE LOSSES REACHED"
+                print(f"\n🛑 [MAX LOSS LIMIT REACHED] 3 Consecutive Losses hit! Bot is now STOPPED completely.")
 
             state.recent_trades.appendleft({
                 "round": round_num,
                 "time": time.time(),
+                "pair": pair,
                 "dir": direction,
+                "duration": duration,
                 "amount": amount,
                 "strike": strike,
                 "close": close_p,
@@ -918,13 +1181,15 @@ class CloudTrader:
                 "pnl": -loss
             })
 
-        # DRAW
+        # ----------------- DRAW -----------------
         else:
             state.total_draws += 1
             state.recent_trades.appendleft({
                 "round": round_num,
                 "time": time.time(),
+                "pair": pair,
                 "dir": direction,
+                "duration": duration,
                 "amount": amount,
                 "strike": strike,
                 "close": close_p,
@@ -934,11 +1199,11 @@ class CloudTrader:
 
 if __name__ == "__main__":
     token = get_token()
-    
-    # Start Web Dashboard on port (daemon thread)
+
+    # 1. Start Web Dashboard HTTP server
     t = threading.Thread(target=start_http_server, daemon=True)
     t.start()
 
-    # Start Trading Engine in main event loop
-    trader = CloudTrader(token)
+    # 2. Start Forex Trading Engine
+    trader = ForexTrader(token)
     asyncio.run(trader.start())
