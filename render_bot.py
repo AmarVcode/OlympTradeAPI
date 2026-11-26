@@ -17,7 +17,7 @@ from olymptrade_ws import OlympTradeClient
 PORT = int(os.environ.get("PORT", 10000))
 ACCOUNT_TYPE = os.environ.get("ACCOUNT_TYPE", "demo").lower() # "real" or "demo"
 BASE_AMOUNT = float(os.environ.get("BASE_AMOUNT", 70.0))     # Starting bet ($70)
-MIN_PAYOUT_RATE = 0.80                                       # Minimum 80% payout required
+MIN_PAYOUT_RATE = float(os.environ.get("MIN_PAYOUT_RATE", 0.75)) # Configurable payout (default 75%+)
 
 # Duration Progression: 8m -> 16m -> 32m -> Stop
 DURATIONS = [8 * 60, 16 * 60, 32 * 60]                       # [480s, 960s, 1920s]
@@ -46,7 +46,7 @@ FOREX_PAIRS = [
 
 # Non-OTC Crypto Pairs to monitor (24/7 Market)
 CRYPTO_PAIRS = [
-    "BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "SOLUSD", "ADAUSD",
+    "BTCUSD", "ETHUSD", "BTC", "ETH", "LTCUSD", "XRPUSD", "SOLUSD", "ADAUSD",
     "DOGEUSD", "DOTUSD", "AVAXUSD", "LINKUSD", "BNBUSD", "TRXUSD",
     "BCHUSD", "ATOMUSD", "MATICUSD"
 ]
@@ -79,6 +79,49 @@ def get_token() -> str:
 
     print("[!] No access token found. Please set OLYMP_ACCESS_TOKEN.")
     sys.exit(1)
+
+import base64
+from datetime import datetime, timezone
+
+def inspect_token(token_str: str) -> Dict[str, Any]:
+    """Inspects JWT token expiry and health."""
+    try:
+        parts = token_str.split('.')
+        if len(parts) >= 2:
+            padded = parts[1] + '=' * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode('utf-8')).decode('utf-8'))
+            exp = payload.get('exp')
+            user_id = payload.get('user_id')
+            if exp:
+                now_ts = time.time()
+                is_expired = now_ts > exp
+                time_diff = exp - now_ts
+                if is_expired:
+                    time_left = "EXPIRED"
+                    status = "EXPIRED"
+                else:
+                    hrs = int(time_diff // 3600)
+                    mins = int((time_diff % 3600) // 60)
+                    time_left = f"{hrs}h {mins}m"
+                    status = "VALID"
+                
+                exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                return {
+                    "valid": not is_expired,
+                    "status": status,
+                    "expires_at": exp_dt,
+                    "time_left": time_left,
+                    "user_id": user_id
+                }
+    except Exception:
+        pass
+    return {
+        "valid": False,
+        "status": "INVALID",
+        "expires_at": "---",
+        "time_left": "UNKNOWN",
+        "user_id": None
+    }
 
 # =====================================================================
 # 📈 TECHNICAL INDICATORS (Supertrend + LuxAlgo Echo Forecast)
@@ -285,6 +328,13 @@ class BotState:
         self.current_bet = BASE_AMOUNT
         self.current_duration_seconds = DURATIONS[0] # Starts at 8m (480s)
         self.cumulative_cycle_loss = 0.0
+
+        # API Connection & Token Health
+        self.api_connected: bool = False
+        self.token_status: str = "CHECKING"        # "VALID", "EXPIRED", "INVALID"
+        self.token_expires_at: str = "---"
+        self.token_time_left: str = "---"
+        self.connection_msg: str = "Connecting to OlympTrade..."
 
         # Market & Signal State
         self.active_pair = "EURUSD"
@@ -501,6 +551,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.4; transform: scale(0.9); }
     }
+    /* Connection & Token Health Box */
+    .conn-box {
+      border-radius: 12px;
+      padding: 12px 18px;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 0.85rem;
+      border: 1px solid var(--card-border);
+      background: var(--card-bg);
+      transition: all 0.3s ease;
+    }
+    .conn-ok {
+      border-color: rgba(16, 185, 129, 0.35);
+      background: rgba(16, 185, 129, 0.05);
+    }
+    .conn-error {
+      border-color: rgba(239, 68, 68, 0.6);
+      background: rgba(239, 68, 68, 0.15);
+      box-shadow: 0 0 15px rgba(239, 68, 68, 0.2);
+    }
+    .conn-item { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .conn-label { font-size: 0.72rem; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+    .badge-api-connected { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
+    .badge-api-disconnected { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+    .badge-token-valid { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid #3b82f6; }
+    .badge-token-expired { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+
     footer { text-align: center; margin-top: 32px; font-size: 0.75rem; color: var(--muted); }
   </style>
 </head>
@@ -511,12 +592,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <h1>📊 OlympTrade Forex & Crypto Trend Bot</h1>
       </div>
       <div class="badges">
-        <span class="badge badge-status"><span class="pulse-dot"></span><span id="bot-status">RUNNING</span></span>
+        <span class="badge" id="api-badge"><span class="pulse-dot" id="api-dot"></span><span id="api-status-text">API: CONNECTING</span></span>
+        <span class="badge" id="token-badge"><span id="token-status-text">TOKEN: CHECKING</span></span>
+        <span class="badge badge-status"><span id="bot-status">RUNNING</span></span>
         <span class="badge" id="account-badge">DEMO</span>
         <span class="badge" style="background:#1f2937; color:#9ca3af;">ID: <span id="account-id">---</span></span>
         <span class="badge" style="background:#1f2937; color:#9ca3af;">UPTIME: <span id="uptime">0m</span></span>
       </div>
     </header>
+
+    <!-- Live Platform & Token Health Bar -->
+    <div id="conn-health-box" class="conn-box conn-ok">
+      <div class="conn-item">
+        <span class="conn-label">BROKER API:</span>
+        <strong id="broker-status-text" style="color:#10b981;">CONNECTED (wss://ws.olymptrade.com)</strong>
+      </div>
+      <div class="conn-item">
+        <span class="conn-label">TOKEN AUTH:</span>
+        <strong id="token-health-text" style="color:#10b981;">ACTIVE &amp; VALID</strong>
+        <span style="color:var(--muted); font-size:0.75rem;">(Expires in: <strong id="token-expiry-left" style="color:#38bdf8;">--</strong> · <span id="token-expiry-date">--</span>)</span>
+      </div>
+      <div class="conn-item">
+        <span class="conn-label">LIVE STATUS:</span>
+        <span id="conn-detail-msg" style="color:var(--muted); font-size:0.8rem;">Ready</span>
+      </div>
+    </div>
 
     <!-- Bot Control Panel -->
     <div class="control-panel">
@@ -679,6 +779,48 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('uptime').textContent = formatUptime(data.uptime);
         updateTradingUI(data.is_running, data.status);
 
+        // Update API & Token Badges & Connection Box
+        const apiBadge = document.getElementById('api-badge');
+        const apiDot = document.getElementById('api-dot');
+        const apiStatusText = document.getElementById('api-status-text');
+        const tokenBadge = document.getElementById('token-badge');
+        const tokenStatusText = document.getElementById('token-status-text');
+        const connBox = document.getElementById('conn-health-box');
+        const brokerStatusText = document.getElementById('broker-status-text');
+        const tokenHealthText = document.getElementById('token-health-text');
+
+        if (data.api_connected) {
+          apiBadge.className = "badge badge-api-connected";
+          apiDot.style.background = "#10b981";
+          apiStatusText.textContent = "API: CONNECTED";
+          brokerStatusText.textContent = "CONNECTED (wss://ws.olymptrade.com)";
+          brokerStatusText.style.color = "#10b981";
+        } else {
+          apiBadge.className = "badge badge-api-disconnected";
+          apiDot.style.background = "#ef4444";
+          apiStatusText.textContent = "API: DISCONNECTED";
+          brokerStatusText.textContent = "DISCONNECTED";
+          brokerStatusText.style.color = "#ef4444";
+        }
+
+        if (data.token_status === "VALID") {
+          tokenBadge.className = "badge badge-token-valid";
+          tokenStatusText.textContent = `TOKEN: VALID (${data.token_time_left} left)`;
+          tokenHealthText.textContent = "ACTIVE & VALID";
+          tokenHealthText.style.color = "#10b981";
+          connBox.className = "conn-box conn-ok";
+        } else {
+          tokenBadge.className = "badge badge-token-expired";
+          tokenStatusText.textContent = `TOKEN: ${data.token_status}`;
+          tokenHealthText.textContent = `EXPIRED / REJECTED (${data.token_status})`;
+          tokenHealthText.style.color = "#ef4444";
+          connBox.className = "conn-box conn-error";
+        }
+
+        document.getElementById('token-expiry-left').textContent = data.token_time_left || '--';
+        document.getElementById('token-expiry-date').textContent = data.token_expires_at || '--';
+        document.getElementById('conn-detail-msg').textContent = data.connection_msg || '';
+
         const badge = document.getElementById('account-badge');
         badge.textContent = data.account_type.toUpperCase();
         badge.className = 'badge ' + (data.account_type === 'real' ? 'badge-live' : 'badge-demo');
@@ -809,6 +951,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = {
                 "status": state.status,
                 "is_running": state.is_running,
+                "api_connected": state.api_connected,
+                "token_status": state.token_status,
+                "token_expires_at": state.token_expires_at,
+                "token_time_left": state.token_time_left,
+                "connection_msg": state.connection_msg,
                 "account_type": state.account_type,
                 "account_id": state.account_id,
                 "starting_balance": state.starting_balance,
@@ -867,6 +1014,23 @@ class ForexTrader:
         self._trade_future: Optional[asyncio.Future] = None
         self.payout_cache: Dict[str, float] = {}
 
+    def update_connection_health(self):
+        """Update live API connection state & token expiry on state container."""
+        token_info = inspect_token(self.token)
+        state.token_status = token_info["status"]
+        state.token_expires_at = token_info["expires_at"]
+        state.token_time_left = token_info["time_left"]
+
+        is_connected = bool(self.client.connection and self.client.connection.is_connected)
+        state.api_connected = is_connected and token_info["valid"]
+
+        if not token_info["valid"]:
+            state.connection_msg = f"Token {token_info['status']}: Please refresh token in .env"
+        elif not is_connected:
+            state.connection_msg = "WebSocket reconnecting to OlympTrade platform..."
+        else:
+            state.connection_msg = "API Connected & Token Valid (OlympTrade WebSockets Active)"
+
     def calculate_next_martingale_bet(self) -> float:
         """Calculate recovery bet for 80%+ payout."""
         payout = state.active_payout if state.active_payout >= 0.5 else 0.80
@@ -924,6 +1088,7 @@ class ForexTrader:
         )
 
         if not candles or len(candles) < 60:
+            print(f"⚠️ [{pair}] Candle feed returned {len(candles) if candles else 0} bars (minimum 60 required). Skipping.")
             return None
 
         # 1. Calculate Supertrend (10, 3.0)
@@ -979,9 +1144,11 @@ class ForexTrader:
 
     async def start(self):
         state.status = "CONNECTING"
+        self.update_connection_health()
         self.client.register_callback(26, self.on_trade_closed)
 
         await self.client.start()
+        self.update_connection_health()
 
         # Balance & Account Info
         balance_info = await self.client.balance.get_balance(timeout=10.0)
@@ -1022,6 +1189,7 @@ class ForexTrader:
         last_assets_refresh = time.time()
 
         while True:
+            self.update_connection_health()
             # Periodically refresh asset payouts every 5 minutes
             if time.time() - last_assets_refresh > 300:
                 await self.update_eligible_assets()
@@ -1235,12 +1403,27 @@ class ForexTrader:
             })
 
 if __name__ == "__main__":
-    token = get_token()
-
     # 1. Start Web Dashboard HTTP server
     t = threading.Thread(target=start_http_server, daemon=True)
     t.start()
 
-    # 2. Start Forex Trading Engine
-    trader = ForexTrader(token)
-    asyncio.run(trader.start())
+    # 2. Resilient Auto-Reconnect Trading Engine
+    async def run_trader_loop():
+        while True:
+            try:
+                token = get_token()
+                trader = ForexTrader(token)
+                await trader.start()
+            except Exception as e:
+                err = str(e)
+                print(f"\n❌ [CONNECTION ERROR] {err}")
+                if "invalid_token" in err.lower() or "1008" in err.lower():
+                    state.status = "ERROR: TOKEN EXPIRED / INVALID"
+                    state.last_setup_info = "Access token is expired! Please paste a fresh token into .env"
+                    print("🛑 [TOKEN EXPIRED] Your OlympTrade access token has expired!")
+                    print("👉 Update OLYMP_ACCESS_TOKEN in .env or Render Environment Variables.")
+                else:
+                    state.status = "DISCONNECTED - RETRYING IN 10s"
+                await asyncio.sleep(10)
+
+    asyncio.run(run_trader_loop())

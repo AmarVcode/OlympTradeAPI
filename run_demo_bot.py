@@ -40,10 +40,23 @@ def main():
     dash_thread = threading.Thread(target=start_http_server, daemon=True)
     dash_thread.start()
 
-    # 2. Run Trading Engine
-    trader = ForexTrader(token)
+    # 2. Run Trading Engine with Reconnect Loop
+    async def run_trader_loop():
+        while True:
+            try:
+                token = get_token()
+                trader = ForexTrader(token)
+                await trader.start()
+            except Exception as e:
+                err = str(e)
+                print(f"\n❌ [CONNECTION ERROR] {err}")
+                if "invalid_token" in err.lower() or "1008" in err.lower():
+                    print("🛑 [TOKEN EXPIRED] Your OlympTrade access token has expired!")
+                    print("👉 Please get a fresh token from your browser and update .env")
+                await asyncio.sleep(10)
+
     try:
-        asyncio.run(trader.start())
+        asyncio.run(run_trader_loop())
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user (Ctrl+C).")
 
