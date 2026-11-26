@@ -38,8 +38,10 @@ class OlympTradeClient:
 
         # --- Internal State ---
         self._latest_balance: Dict[str, Any] = {} # Store latest balance update (e:55)
-        self.account_id = None
-        self.account_group = None # To store the account group (demo/real)
+        if self.account_id is None:
+            self.account_id = account_id
+        if self.account_group is None:
+            self.account_group = account_group # To store the account group (demo/real)
 
 
     async def start(self):
@@ -351,17 +353,18 @@ class OlympTradeClient:
         import uuid
         for _ in range(2):
             await self.send_request(90, {}, requires_response=True)  # uuid auto-generated
-        # 3. Check if account info was already received via event 55 (balance update)
+        preferred_group = self.account_group or 'real'
         if self._latest_balance and 'd' in self._latest_balance and isinstance(self._latest_balance['d'], list):
             for acc in self._latest_balance['d']:
-                if acc.get('group') == (self.account_group or 'demo'):
+                if acc.get('group') == preferred_group:
                     self.account_id = acc.get('account_id')
                     self.account_group = acc.get('group')
                     logger.info(f"Detected account_id {self.account_id} ({self.account_group}) from initial balance push.")
                     break
 
         if not self.account_id:
-            for group in ["demo", "real"]:
+            search_groups = [self.account_group] if self.account_group else ["real", "demo"]
+            for group in search_groups:
                 try:
                     resp = await self.send_request(1068, [{"group": group}], requires_response=True, timeout=3.0)
                     logger.info(f"Account info response for group {group}: {resp}")

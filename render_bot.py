@@ -14,27 +14,45 @@ from olymptrade_ws import OlympTradeClient
 # =====================================================================
 # ⚙️ CONFIGURATION & SETTINGS
 # =====================================================================
+# Automatically load .env file
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path, "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                _k = _k.strip()
+                _v = _v.strip().strip('"').strip("'")
+                if _k not in os.environ:
+                    os.environ[_k] = _v
+
 PORT = int(os.environ.get("PORT", 10000))
-ACCOUNT_TYPE = os.environ.get("ACCOUNT_TYPE", "demo").lower() # "real" or "demo"
-BASE_AMOUNT = float(os.environ.get("BASE_AMOUNT", 70.0))     # Starting bet ($70)
+ACCOUNT_TYPE = os.environ.get("ACCOUNT_TYPE", "real").lower() # Default to "real" for Live Trading
+BASE_AMOUNT = float(os.environ.get("BASE_AMOUNT", 70.0))     # Starting bet ($70 / ₹70)
 MIN_PAYOUT_RATE = float(os.environ.get("MIN_PAYOUT_RATE", 0.75)) # Configurable payout (default 75%+)
 
 # Duration Progression: 8m -> 16m -> 32m -> Stop
 DURATIONS = [8 * 60, 16 * 60, 32 * 60]                       # [480s, 960s, 1920s]
 MAX_CONSECUTIVE_LOSSES = 3                                   # Stop after 3 consecutive losses
-CANDLE_TIMEFRAME = 60                                        # 1-minute candle construction (60s)
-CANDLE_HISTORY_COUNT = 160                                   # 160 candles needed for Echo Forecast
+CANDLE_TIMEFRAME = 60                                        # Fixed 1-minute candle timeframe (60s)
+CANDLE_HISTORY_COUNT = 180                                   # 180 candles for MA Sabres (TEMA 50) + Echo Forecast
 
 # Indicator Parameters (from TradingView Pine Scripts)
-# 1. Supertrend (TradingView built-in)
-SUPERTREND_ATR_PERIOD = 10
-SUPERTREND_FACTOR = 3.0
+# 1. MA Sabres [LuxAlgo] (Replaces Supertrend)
+MA_SABRES_TYPE = "TEMA"                                      # TEMA / EMA / SMA
+MA_SABRES_LENGTH = 50                                        # Length
+MA_SABRES_COUNT = 20                                         # Previous Trend Duration
 
 # 2. The Echo Forecast [LuxAlgo]
 ECHO_EVAL_LENGTH = 50                                        # Evaluation Window
 ECHO_FCAST_WINDOW = 50                                       # Forecast Window
 ECHO_FMODE = "Similarity"                                    # 'Similarity' or 'Dissimilarity'
 ECHO_CMODE = "Cumulative"                                    # 'Cumulative' or 'Mean'
+
+# 3. Hourly Fallback Probability Trading
+HOURLY_TRADE_ENABLED = os.environ.get("HOURLY_TRADE_ENABLED", "true").lower() == "true"
+HOURLY_TRADE_INTERVAL = int(os.environ.get("HOURLY_TRADE_INTERVAL", "3600"))  # 3600s = 1 hour
 
 # Non-OTC Forex Pairs to monitor
 FOREX_PAIRS = [
@@ -124,77 +142,109 @@ def inspect_token(token_str: str) -> Dict[str, Any]:
     }
 
 # =====================================================================
-# 📈 TECHNICAL INDICATORS (Supertrend + LuxAlgo Echo Forecast)
+# 📈 TECHNICAL INDICATORS (MA Sabres [LuxAlgo] + LuxAlgo Echo Forecast)
 # =====================================================================
-def calculate_supertrend(candles: List[Dict[str, float]], atr_period: int = 10, factor: float = 3.0) -> Tuple[Optional[float], Optional[int]]:
+def calc_ema_series(values: List[float], length: int) -> List[Optional[float]]:
+    """Calculates Exponential Moving Average series matching Pine Script ta.ema."""
+    n = len(values)
+    if n < length:
+        return [None] * n
+    alpha = 2.0 / (length + 1)
+    out: List[Optional[float]] = [None] * n
+    out[length - 1] = sum(values[:length]) / length
+    for i in range(length, n):
+        out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1] # type: ignore
+    return out
+
+def calculate_ma_sabres(
+    closes: List[float],
+    ma_type: str = "TEMA",
+    length: int = 50,
+    count: int = 20
+) -> Optional[Dict[str, Any]]:
     """
-    Exact Pine Script ta.supertrend(factor, atrPeriod) implementation.
-    Returns: (supertrend_value, direction)
-    direction: -1 = Uptrend (Bullish/Green), 1 = Downtrend (Bearish/Red)
+    Exact Pine Script implementation of MA Sabres [LuxAlgo] from indicator/ma-sabres.
+    ma    = type.ma(len)
+    fl    = ta.falling(ma, count)
+    rs    = ta.rising(ma, count)
+    up    = fl[1] and ma > ma[1]
+    dn    = rs[1] and ma < ma[1]
     """
-    n = len(candles)
-    if n < atr_period + 1:
-        return None, None
+    n = len(closes)
+    if n < 30:
+        return None
 
-    # 1. True Range (TR)
-    trs = []
-    for i in range(n):
-        h = candles[i]['high']
-        l = candles[i]['low']
-        if i == 0:
-            trs.append(h - l)
-        else:
-            prev_c = candles[i - 1]['close']
-            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-            trs.append(tr)
+    # Dynamically scale down if series is shorter than 3*length
+    eff_len = length
+    eff_count = count
+    if n < length * 3:
+        eff_len = max(10, n // 3)
+        eff_count = max(5, eff_len // 2)
 
-    # 2. Wilder's RMA Smoothing for ATR
-    atrs = [0.0] * n
-    atrs[atr_period - 1] = sum(trs[:atr_period]) / atr_period
-    for i in range(atr_period, n):
-        atrs[i] = (atrs[i - 1] * (atr_period - 1) + trs[i]) / atr_period
+    # 1. Moving Average Calculation (Default: TEMA)
+    if ma_type == "TEMA":
+        ema1 = calc_ema_series(closes, eff_len)
+        first_v1 = eff_len - 1
+        sub_ema1 = [x for x in ema1[first_v1:] if x is not None]
+        sub_ema2 = calc_ema_series(sub_ema1, eff_len)
+        ema2 = [None] * first_v1 + sub_ema2
 
-    # 3. Supertrend Bands & Direction
-    upper_band = [0.0] * n
-    lower_band = [0.0] * n
-    supertrend = [0.0] * n
-    direction = [1] * n
+        first_v2 = first_v1 + eff_len - 1
+        sub_ema2_valid = [x for x in ema2[first_v2:] if x is not None]
+        sub_ema3 = calc_ema_series(sub_ema2_valid, eff_len)
+        ema3 = [None] * first_v2 + sub_ema3
 
-    for i in range(atr_period - 1, n):
-        hl2 = (candles[i]['high'] + candles[i]['low']) / 2.0
-        basic_upper = hl2 + factor * atrs[i]
-        basic_lower = hl2 - factor * atrs[i]
+        ma: List[Optional[float]] = [None] * n
+        for i in range(n):
+            if ema1[i] is not None and ema2[i] is not None and ema3[i] is not None:
+                ma[i] = (3.0 * ema1[i]) - (3.0 * ema2[i]) + ema3[i] # type: ignore
+    elif ma_type == "SMA":
+        ma = [None] * n
+        for i in range(eff_len - 1, n):
+            ma[i] = sum(closes[i - eff_len + 1 : i + 1]) / eff_len
+    else:
+        ma = calc_ema_series(closes, eff_len)
 
-        if i == atr_period - 1:
-            upper_band[i] = basic_upper
-            lower_band[i] = basic_lower
-            direction[i] = 1 if candles[i]['close'] < basic_upper else -1
-            supertrend[i] = upper_band[i] if direction[i] == 1 else lower_band[i]
+    # 2. ta.falling & ta.rising for eff_count bars
+    fl = [False] * n
+    rs = [False] * n
+    for i in range(eff_count, n):
+        if any(ma[i - k] is None for k in range(eff_count + 1)):
             continue
+        fl[i] = all(ma[i - k] < ma[i - k - 1] for k in range(eff_count)) # type: ignore
+        rs[i] = all(ma[i - k] > ma[i - k - 1] for k in range(eff_count)) # type: ignore
 
-        prev_close = candles[i - 1]['close']
+    # 3. Up and Dn Reversal Triggers
+    up = [False] * n
+    dn = [False] * n
+    for i in range(1, n):
+        if ma[i] is not None and ma[i - 1] is not None:
+            up[i] = bool(fl[i - 1] and ma[i] > ma[i - 1]) # type: ignore
+            dn[i] = bool(rs[i - 1] and ma[i] < ma[i - 1]) # type: ignore
 
-        # Upper band adjustment
-        if basic_upper < upper_band[i - 1] or prev_close > upper_band[i - 1]:
-            upper_band[i] = basic_upper
-        else:
-            upper_band[i] = upper_band[i - 1]
+    # 4. State Tracking (UP or DOWN)
+    current_direction = "NEUTRAL"
+    last_signal_idx = -1
+    for i in range(n):
+        if up[i]:
+            current_direction = "UP"
+            last_signal_idx = i
+        elif dn[i]:
+            current_direction = "DOWN"
+            last_signal_idx = i
 
-        # Lower band adjustment
-        if basic_lower > lower_band[i - 1] or prev_close < lower_band[i - 1]:
-            lower_band[i] = basic_lower
-        else:
-            lower_band[i] = lower_band[i - 1]
+    # Fallback to current slope if no prior reversal signal in window
+    if current_direction == "NEUTRAL" and ma[-1] is not None and ma[-2] is not None:
+        current_direction = "UP" if ma[-1] > ma[-2] else "DOWN"
 
-        # Direction logic matching Pine Script
-        if supertrend[i - 1] == upper_band[i - 1]:
-            direction[i] = -1 if candles[i]['close'] > upper_band[i] else 1
-        else:
-            direction[i] = 1 if candles[i]['close'] < lower_band[i] else -1
-
-        supertrend[i] = lower_band[i] if direction[i] == -1 else upper_band[i]
-
-    return supertrend[-1], direction[-1]
+    return {
+        "ma": round(ma[-1], 5) if ma[-1] is not None else 0.0,
+        "up_trigger": up[-1],
+        "dn_trigger": dn[-1],
+        "direction": current_direction,
+        "bars_since_signal": (n - 1 - last_signal_idx) if last_signal_idx != -1 else 999,
+        "is_rising": bool(ma[-1] > ma[-2]) if ma[-1] is not None and ma[-2] is not None else False
+    }
 
 
 def calculate_echo_forecast(
@@ -295,6 +345,89 @@ def calculate_echo_forecast(
         "forecast_points": forecast_points
     }
 
+
+def evaluate_trade_probability(
+    closes: List[float],
+    sabres_res: Dict[str, Any],
+    echo_res: Dict[str, Any],
+    payout: float
+) -> Dict[str, Any]:
+    """
+    Computes statistical edge / win probability percentage for an asset.
+    Combines:
+    1. Echo Forecast historical pattern similarity (Pearson r) & forecast return magnitude
+    2. MA Sabres [LuxAlgo] TEMA trend direction, slope (is_rising), and position
+    3. Reversal triggers (up_trigger, dn_trigger)
+    4. Payout weighting
+    """
+    corr = echo_res.get("correlation", 0.0)
+    echo_dir = echo_res.get("direction", "up").lower()
+    proj_pct = echo_res.get("projected_pct", 0.0)
+
+    sabres_dir = sabres_res.get("direction", "UP").upper()
+    is_rising = sabres_res.get("is_rising", False)
+    ma_val = sabres_res.get("ma", closes[-1])
+    price_above_ma = closes[-1] >= ma_val
+
+    # 1. Echo Forecast Score Component (up to 45 pts)
+    corr_pts = max(0.0, corr) * 35.0
+    slope_pts = min(10.0, max(0.0, abs(proj_pct) * 50.0))
+    echo_total = corr_pts + slope_pts
+
+    up_score = 0.0
+    down_score = 0.0
+
+    if echo_dir == "up":
+        up_score += echo_total
+    else:
+        down_score += echo_total
+
+    # 2. MA Sabres Trend & Momentum Component (up to 45 pts)
+    if sabres_dir == "UP":
+        up_score += 25.0
+    elif sabres_dir == "DOWN":
+        down_score += 25.0
+
+    if is_rising:
+        up_score += 10.0
+    else:
+        down_score += 10.0
+
+    if price_above_ma:
+        up_score += 10.0
+    else:
+        down_score += 10.0
+
+    # 3. Reversal Triggers Bonus (up to 10 pts)
+    if sabres_res.get("up_trigger"):
+        up_score += 10.0
+    if sabres_res.get("dn_trigger"):
+        down_score += 10.0
+
+    # 4. Final Probability Calculation
+    if up_score >= down_score:
+        favored_dir = "up"
+        delta = up_score - down_score
+    else:
+        favored_dir = "down"
+        delta = down_score - up_score
+
+    # Map delta (0 to 100) to win probability (50% to 92%)
+    prob = round(min(92.0, 50.0 + (delta * 0.42)), 1)
+    effective_score = round(prob * (payout / 100.0), 2)
+
+    return {
+        "direction": favored_dir,
+        "probability": prob,
+        "effective_score": effective_score,
+        "payout": payout,
+        "sabres_dir": sabres_dir,
+        "echo_dir": echo_dir.upper(),
+        "echo_corr": corr,
+        "echo_proj": proj_pct,
+        "ma": ma_val
+    }
+
 # =====================================================================
 # 🌐 GLOBAL BOT STATE
 # =====================================================================
@@ -329,6 +462,14 @@ class BotState:
         self.current_duration_seconds = DURATIONS[0] # Starts at 8m (480s)
         self.cumulative_cycle_loss = 0.0
 
+        # Hourly Fallback Probability Trading State
+        self.last_trade_time = time.time()
+        self.time_since_last_trade = 0
+        self.time_until_hourly_trade = HOURLY_TRADE_INTERVAL
+        self.hourly_trade_enabled = HOURLY_TRADE_ENABLED
+        self.last_trade_type = "NONE"             # "CONFLUENCE" or "HOURLY_PROB"
+        self.last_evaluated_prob = 0.0
+
         # API Connection & Token Health
         self.api_connected: bool = False
         self.token_status: str = "CHECKING"        # "VALID", "EXPIRED", "INVALID"
@@ -342,8 +483,10 @@ class BotState:
         self.active_asset_type = "FOREX"            # "FOREX" or "CRYPTO"
         self.active_payout = 0.82
         self.eligible_pairs: List[Dict[str, Any]] = []
-        self.supertrend_direction = "UNKNOWN"       # "UPTREND" or "DOWNTREND"
-        self.supertrend_value = 0.0
+        self.ma_sabres_direction = "UNKNOWN"       # "UP" or "DOWN"
+        self.ma_sabres_value = 0.0
+        self.ma_sabres_trigger = "NONE"
+        self.supertrend_direction = "UNKNOWN"       # Backwards compatibility alias
         self.echo_direction = "UNKNOWN"             # "UP" or "DOWN"
         self.echo_projection_pct = 0.0
         self.echo_correlation = 0.0
@@ -360,7 +503,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OlympTrade Forex Bot (Supertrend + Echo Forecast)</title>
+  <title>OlympTrade Forex & Crypto Bot (MA Sabres + Echo Forecast)</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
@@ -613,6 +756,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span style="color:var(--muted); font-size:0.75rem;">(Expires in: <strong id="token-expiry-left" style="color:#38bdf8;">--</strong> · <span id="token-expiry-date">--</span>)</span>
       </div>
       <div class="conn-item">
+        <span class="conn-label">HOURLY FALLBACK:</span>
+        <strong id="hourly-status-text" style="color:#38bdf8;">ACTIVE (Every 60m)</strong>
+        <span style="color:var(--muted); font-size:0.75rem;">(Next check: <strong id="hourly-countdown-text" style="color:#f59e0b;">60m 00s</strong> · Since last trade: <span id="time-since-last-trade">0m</span>)</span>
+      </div>
+      <div class="conn-item">
         <span class="conn-label">LIVE STATUS:</span>
         <span id="conn-detail-msg" style="color:var(--muted); font-size:0.8rem;">Ready</span>
       </div>
@@ -633,14 +781,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- Strategy & Indicators Banner -->
     <div class="strategy-banner">
       <div>
-        <div class="strategy-title">🎯 Supertrend (10, 3.0) + LuxAlgo Echo Forecast (50, 50)</div>
+        <div class="strategy-title">🎯 MA Sabres [LuxAlgo] (TEMA 50, 20) + LuxAlgo Echo Forecast (50, 50)</div>
         <div class="strategy-desc">
-          Real Forex & Crypto Pairs (No OTC) · Payout &ge; 80% · Durations: 8m &rarr; 16m &rarr; 32m &rarr; Max 3 Losses Stop
+          Fixed 1-Minute Analysis · Real Forex &amp; Crypto (No OTC) · Both Must Confirm UP / DOWN · Max 1 Active Trade
         </div>
         <div style="margin-top: 8px;">
-          <span class="indicator-pill">Supertrend: <strong id="ind-supertrend" style="color:#60a5fa;">SCANNING</strong></span>
+          <span class="indicator-pill">Timeframe: <strong style="color:#38bdf8;">1m FIXED</strong></span>
+          <span class="indicator-pill">MA Sabres: <strong id="ind-sabres" style="color:#60a5fa;">SCANNING</strong></span>
           <span class="indicator-pill">Echo Forecast: <strong id="ind-echo" style="color:#a78bfa;">SCANNING</strong></span>
           <span class="indicator-pill">Pair: <strong id="active-pair" style="color:#34d399;">EURUSD</strong> (<span id="pair-payout">82%</span>) [<span id="asset-type" style="color:#f59e0b;">FOREX</span>]</span>
+          <span class="indicator-pill">Hourly Fallback: <strong id="pill-hourly-countdown" style="color:#f59e0b;">60m 00s</strong></span>
         </div>
       </div>
       <div style="font-family:'JetBrains Mono'; font-size:0.85rem; text-align:right;">
@@ -691,6 +841,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <tr>
             <th>Round</th>
             <th>Time</th>
+            <th>Type</th>
             <th>Pair</th>
             <th>Direction</th>
             <th>Duration</th>
@@ -702,13 +853,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </tr>
         </thead>
         <tbody id="trades-body">
-          <tr><td colspan="10" style="text-align:center; color:var(--muted); padding:24px;">Waiting for first Forex trade setup...</td></tr>
+          <tr><td colspan="10" style="text-align:center; color:var(--muted); padding:24px;">Waiting for first Forex / Crypto trade setup...</td></tr>
         </tbody>
       </table>
     </div>
 
     <footer>
-      OlympTrade Automated Forex Cloud Bot · Supertrend + Echo Forecast Strategy · Auto-KeepAlive Active
+      OlympTrade Automated Forex & Crypto Cloud Bot · MA Sabres + Echo Forecast Strategy · Auto-KeepAlive Active
     </footer>
   </div>
 
@@ -822,7 +973,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('conn-detail-msg').textContent = data.connection_msg || '';
 
         const badge = document.getElementById('account-badge');
-        badge.textContent = data.account_type.toUpperCase();
+        badge.textContent = data.account_type === 'real' ? '🔴 LIVE REAL MONEY' : '🧪 DEMO ACCOUNT';
         badge.className = 'badge ' + (data.account_type === 'real' ? 'badge-live' : 'badge-demo');
 
         // PnL & Balance
@@ -831,6 +982,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         pnlEl.className = 'card-val ' + (data.net_session_pnl >= 0 ? 'val-green' : 'val-red');
         document.getElementById('pnl-sub').textContent = 'Starting: $' + Number(data.starting_balance).toLocaleString('en-US', {minimumFractionDigits:2});
         document.getElementById('curr-balance').textContent = '$' + Number(data.current_balance).toLocaleString('en-US', {minimumFractionDigits:2});
+        const balSub = document.getElementById('balance-sub');
+        if (balSub) balSub.textContent = data.account_type === 'real' ? 'Account: LIVE REAL' : 'Account: DEMO';
 
         // Consecutive Losses
         const lossCount = data.consecutive_losses || 0;
@@ -854,13 +1007,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('asset-type').textContent = data.active_asset_type || 'FOREX';
         document.getElementById('pair-payout').textContent = Math.round((data.active_payout || 0.8) * 100) + '%';
         
-        const stEl = document.getElementById('ind-supertrend');
-        stEl.textContent = data.supertrend_direction;
-        stEl.style.color = data.supertrend_direction === 'UPTREND' ? '#34d399' : (data.supertrend_direction === 'DOWNTREND' ? '#f87171' : '#9ca3af');
+        const sabresEl = document.getElementById('ind-sabres');
+        sabresEl.textContent = `${data.ma_sabres_direction || 'SCANNING'} (${data.ma_sabres_value || '--'})`;
+        sabresEl.style.color = data.ma_sabres_direction === 'UP' ? '#34d399' : (data.ma_sabres_direction === 'DOWN' ? '#f87171' : '#9ca3af');
 
         const echoEl = document.getElementById('ind-echo');
         echoEl.textContent = `${data.echo_direction} (${data.echo_projection_pct > 0 ? '+' : ''}${data.echo_projection_pct}%)`;
         echoEl.style.color = data.echo_direction === 'UP' ? '#34d399' : (data.echo_direction === 'DOWN' ? '#f87171' : '#9ca3af');
+
+        // Update Hourly Fallback Timers
+        const timeUntilHourly = (data.time_until_hourly_trade !== undefined) ? data.time_until_hourly_trade : 3600;
+        const timeSinceTrade = (data.time_since_last_trade !== undefined) ? data.time_since_last_trade : 0;
+        const minsLeft = Math.floor(timeUntilHourly / 60);
+        const secsLeft = timeUntilHourly % 60;
+        const countdownStr = `${minsLeft}m ${secsLeft.toString().padStart(2, '0')}s`;
+        const minsSince = Math.floor(timeSinceTrade / 60);
+        const sinceStr = minsSince > 0 ? `${minsSince}m ago` : 'Just now';
+
+        const hourlyCountdownEl = document.getElementById('hourly-countdown-text');
+        if (hourlyCountdownEl) hourlyCountdownEl.textContent = countdownStr;
+        const pillHourlyEl = document.getElementById('pill-hourly-countdown');
+        if (pillHourlyEl) pillHourlyEl.textContent = countdownStr;
+        const timeSinceEl = document.getElementById('time-since-last-trade');
+        if (timeSinceEl) timeSinceEl.textContent = sinceStr;
 
         // Trades Table
         if (data.recent_trades && data.recent_trades.length > 0) {
@@ -871,9 +1040,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const isWin = t.status === 'win' || t.pnl > 0;
             const pnlFormatted = formatMoney(t.pnl);
             const dur = Math.round((t.duration || 480) / 60);
+            const typeBadge = t.type === 'HOURLY_PROB'
+              ? `<span class="badge" style="background:rgba(245,158,11,0.2); color:#fbbf24; border:1px solid #f59e0b; font-size:0.65rem;">HOURLY (${t.prob || 0}%)</span>`
+              : `<span class="badge" style="background:rgba(59,130,246,0.2); color:#60a5fa; border:1px solid #3b82f6; font-size:0.65rem;">CONFLUENCE</span>`;
             tr.innerHTML = `
               <td>#${t.round}</td>
               <td>${formatTime(t.time)}</td>
+              <td>${typeBadge}</td>
               <td><strong>${t.pair || 'EURUSD'}</strong></td>
               <td><span class="${t.dir === 'up' ? 'badge-dir-up' : 'badge-dir-down'}">${t.dir.toUpperCase()}</span></td>
               <td>${dur}m</td>
@@ -975,10 +1148,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "active_forex_pair": state.active_pair,
                 "active_asset_type": state.active_asset_type,
                 "active_payout": state.active_payout,
-                "supertrend_direction": state.supertrend_direction,
+                "ma_sabres_direction": state.ma_sabres_direction,
+                "ma_sabres_value": state.ma_sabres_value,
+                "ma_sabres_trigger": state.ma_sabres_trigger,
+                "timeframe": "1m",
+                "supertrend_direction": state.ma_sabres_direction,
                 "echo_direction": state.echo_direction,
                 "echo_projection_pct": state.echo_projection_pct,
                 "last_setup_info": state.last_setup_info,
+                "last_trade_time": int(state.last_trade_time),
+                "time_since_last_trade": int(time.time() - state.last_trade_time),
+                "time_until_hourly_trade": max(0, HOURLY_TRADE_INTERVAL - int(time.time() - state.last_trade_time)),
+                "hourly_trade_enabled": state.hourly_trade_enabled,
+                "last_trade_type": state.last_trade_type,
+                "last_evaluated_prob": state.last_evaluated_prob,
                 "recent_trades": list(state.recent_trades)
             }
             self.wfile.write(json.dumps(payload).encode('utf-8'))
@@ -1013,6 +1196,7 @@ class ForexTrader:
         self._pending_trade_id: Optional[int] = None
         self._trade_future: Optional[asyncio.Future] = None
         self.payout_cache: Dict[str, float] = {}
+        self.last_trade_time = time.time()
 
     def update_connection_health(self):
         """Update live API connection state & token expiry on state container."""
@@ -1078,29 +1262,40 @@ class ForexTrader:
 
     async def scan_for_signal(self, pair: str) -> Optional[str]:
         """
-        Fetches 1m candles for pair and computes Supertrend + Echo Forecast.
-        Returns 'up', 'down', or None.
+        Fetches 1m candles for pair and computes MA Sabres [LuxAlgo] + Echo Forecast.
+        Only one trade can be active at a time. Returns 'up', 'down', or None.
         """
+        if self.is_trading:
+            return None
+
         candles = await self.client.market.get_candles(
             pair=pair,
-            size=CANDLE_TIMEFRAME,
+            size=CANDLE_TIMEFRAME, # Fixed 60s (1m) timeframe
             count=CANDLE_HISTORY_COUNT
         )
 
-        if not candles or len(candles) < 60:
-            print(f"⚠️ [{pair}] Candle feed returned {len(candles) if candles else 0} bars (minimum 60 required). Skipping.")
+        if not candles or len(candles) < 30:
+            print(f"⚠️ [{pair}] Candle feed returned {len(candles) if candles else 0} bars. Skipping.")
             return None
 
-        # 1. Calculate Supertrend (10, 3.0)
-        st_val, st_dir = calculate_supertrend(candles, SUPERTREND_ATR_PERIOD, SUPERTREND_FACTOR)
-        if st_dir is None:
-            return None
-        
-        state.supertrend_value = round(st_val or 0.0, 5)
-        state.supertrend_direction = "UPTREND" if st_dir < 0 else "DOWNTREND"
-
-        # 2. Calculate Echo Forecast [LuxAlgo] (50, 50)
         closes = [float(c["close"]) for c in candles]
+
+        # 1. Calculate MA Sabres [LuxAlgo] (TEMA 50, count 20) on 1-minute closes
+        sabres_res = calculate_ma_sabres(
+            closes=closes,
+            ma_type=MA_SABRES_TYPE,
+            length=MA_SABRES_LENGTH,
+            count=MA_SABRES_COUNT
+        )
+        if not sabres_res:
+            return None
+
+        state.ma_sabres_value = sabres_res["ma"]
+        state.ma_sabres_direction = sabres_res["direction"] # "UP" or "DOWN"
+        state.supertrend_direction = sabres_res["direction"] # Compatibility
+        state.ma_sabres_trigger = "UP" if sabres_res["up_trigger"] else ("DOWN" if sabres_res["dn_trigger"] else "NONE")
+
+        # 2. Calculate Echo Forecast [LuxAlgo] (50, 50) on 1-minute closes
         echo_res = calculate_echo_forecast(
             closes=closes,
             length=ECHO_EVAL_LENGTH,
@@ -1115,23 +1310,87 @@ class ForexTrader:
         state.echo_projection_pct = echo_res["projected_pct"]
         state.echo_correlation = echo_res["correlation"]
 
-        # 3. Combine Indicator Signals
-        # CALL (UP): Supertrend Uptrend (direction < 0) AND Echo Forecast is UP
-        if st_dir < 0 and echo_res["direction"] == "up":
-            state.last_setup_info = f"[{pair}] Supertrend UPTREND & Echo Forecast BULLISH (+{echo_res['projected_pct']}%)"
-            print(f"🎯 [DEMO SIGNAL ALIGNED - BUY UP] {state.last_setup_info}")
+        # 3. Combine Indicator Signals: BOTH MA Sabres and Echo Forecast must say UP or DOWN
+        # Both say UP -> Place BUY UP
+        if sabres_res["direction"] == "UP" and echo_res["direction"] == "up":
+            state.last_setup_info = f"[{pair} 1m] MA Sabres UP (TEMA: {sabres_res['ma']}) & Echo Forecast UP (+{echo_res['projected_pct']}%)"
+            print(f"🎯 [ALIGNED - BUY UP] {state.last_setup_info}")
             return "up"
 
-        # PUT (DOWN): Supertrend Downtrend (direction > 0) AND Echo Forecast is DOWN
-        elif st_dir > 0 and echo_res["direction"] == "down":
-            state.last_setup_info = f"[{pair}] Supertrend DOWNTREND & Echo Forecast BEARISH ({echo_res['projected_pct']}%)"
-            print(f"🎯 [DEMO SIGNAL ALIGNED - SELL DOWN] {state.last_setup_info}")
+        # Both say DOWN -> Place SELL DOWN
+        elif sabres_res["direction"] == "DOWN" and echo_res["direction"] == "down":
+            state.last_setup_info = f"[{pair} 1m] MA Sabres DOWN (TEMA: {sabres_res['ma']}) & Echo Forecast DOWN ({echo_res['projected_pct']}%)"
+            print(f"🎯 [ALIGNED - SELL DOWN] {state.last_setup_info}")
             return "down"
 
         else:
-            print(f"👀 [DEMO SCAN {pair}] Supertrend: {state.supertrend_direction} ({st_val:.5f}) vs Echo: {state.echo_direction} ({echo_res['projected_pct']:+.2f}%, Corr: {echo_res['correlation']:.2f}) -> Waiting alignment")
+            print(f"👀 [1m SCAN {pair}] MA Sabres: {sabres_res['direction']} ({sabres_res['ma']}) vs Echo: {state.echo_direction} ({echo_res['projected_pct']:+.2f}%, Corr: {echo_res['correlation']:.2f}) -> Waiting alignment")
 
         return None
+
+    async def find_highest_probability_trade(self) -> Optional[Dict[str, Any]]:
+        """
+        Scans all open eligible Forex & Crypto assets (with payout >= MIN_PAYOUT_RATE)
+        and evaluates their win probability based on:
+        1. Echo Forecast historical pattern correlation (r) and projected return slope %
+        2. MA Sabres [LuxAlgo] TEMA trend direction, reversal triggers, and momentum
+        3. Broker payout rate weighting
+        Returns the asset and direction with the highest statistical probability.
+        """
+        if not state.eligible_pairs:
+            await self.update_eligible_assets()
+
+        candidates = state.eligible_pairs if state.eligible_pairs else [{"pair": state.active_pair, "payout": 0.82}]
+        evaluated: List[Dict[str, Any]] = []
+
+        print(f"\n📊 [HOURLY PROBABILITY SCAN] Evaluating {len(candidates)} assets to pick highest statistical probability...")
+
+        for item in candidates[:8]:  # Evaluate top 8 available pairs
+            pair = item["pair"]
+            payout = item.get("payout", 0.82)
+            try:
+                candles = await self.client.market.get_candles(
+                    pair=pair,
+                    size=CANDLE_TIMEFRAME,
+                    count=CANDLE_HISTORY_COUNT
+                )
+                if not candles or len(candles) < 30:
+                    continue
+
+                closes = [float(c["close"]) for c in candles]
+
+                sabres_res = calculate_ma_sabres(
+                    closes=closes,
+                    ma_type=MA_SABRES_TYPE,
+                    length=MA_SABRES_LENGTH,
+                    count=MA_SABRES_COUNT
+                )
+                echo_res = calculate_echo_forecast(
+                    closes=closes,
+                    length=ECHO_EVAL_LENGTH,
+                    fcast=ECHO_FCAST_WINDOW,
+                    fmode=ECHO_FMODE,
+                    cmode=ECHO_CMODE
+                )
+
+                if not sabres_res or not echo_res:
+                    continue
+
+                payout_pct = payout * 100.0 if payout <= 1.0 else payout
+                prob_info = evaluate_trade_probability(closes, sabres_res, echo_res, payout_pct)
+                prob_info["pair"] = pair
+                evaluated.append(prob_info)
+                print(f"   • {pair}: Win Prob {prob_info['probability']}% for {prob_info['direction'].upper()} (Score: {prob_info['effective_score']}, Echo: {prob_info['echo_dir']} [r={prob_info['echo_corr']:.2f}], Sabres: {prob_info['sabres_dir']})")
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                print(f"⚠️ Error evaluating probability for {pair}: {e}")
+
+        if not evaluated:
+            return None
+
+        # Sort highest effective score first
+        evaluated.sort(key=lambda x: x["effective_score"], reverse=True)
+        return evaluated[0]
 
     async def on_trade_closed(self, message: Dict[str, Any]):
         """Event 26: Trade Closed Callback"""
@@ -1166,18 +1425,32 @@ class ForexTrader:
                     break
 
         if not target_acc and self.client.account_id:
-            target_acc = {'account_id': self.client.account_id, 'amount': 10000.0, 'group': ACCOUNT_TYPE}
+            # Use actual client account if detected by connection
+            detected_group = getattr(self.client, 'account_group', ACCOUNT_TYPE)
+            if detected_group == ACCOUNT_TYPE:
+                target_acc = {'account_id': self.client.account_id, 'amount': 0.0, 'group': ACCOUNT_TYPE}
 
         if not target_acc:
-            state.status = "ERROR_NO_ACCOUNT"
-            print(f"❌ Error: Account type '{ACCOUNT_TYPE}' not found.")
+            state.status = f"ERROR_{ACCOUNT_TYPE.upper()}_ACCOUNT_NOT_FOUND"
+            print(f"❌ Error: Account type '{ACCOUNT_TYPE}' not found in OlympTrade account list.")
             return
 
         state.account_id = target_acc['account_id']
         state.starting_balance = float(target_acc.get('amount', 0.0))
         state.current_balance = state.starting_balance
-        state.status = "SCANNING_FOREX"
-        print(f"✅ Connected to {ACCOUNT_TYPE.upper()} Account ID: {state.account_id} | Balance: ${state.starting_balance:,.2f}")
+        state.status = "SCANNING_MARKET"
+        
+        if ACCOUNT_TYPE == "real":
+            print("=" * 65)
+            print("🔴 [LIVE REAL ACCOUNT ACTIVATED] TRADING WITH REAL CAPITAL")
+            print(f"💰 Account ID: {state.account_id} | Live Balance: ${state.starting_balance:,.2f}")
+            print(f"🎯 Strategy: MA Sabres (TEMA 50, 20) + Echo Forecast (50, 50)")
+            print(f"💵 Base Bet: ${BASE_AMOUNT:.2f} | Consecutive Loss Limit: {MAX_CONSECUTIVE_LOSSES}")
+            print("=" * 65)
+            if state.starting_balance < BASE_AMOUNT:
+                print(f"⚠️ [WARNING] Live balance (${state.starting_balance:.2f}) is lower than the starting bet (${BASE_AMOUNT:.2f})!")
+        else:
+            print(f"✅ Connected to DEMO Account ID: {state.account_id} | Balance: ${state.starting_balance:,.2f}")
 
         # Identify eligible Forex & Crypto pairs with >= 80% payout
         await self.update_eligible_assets()
@@ -1187,6 +1460,7 @@ class ForexTrader:
 
         round_num = 1
         last_assets_refresh = time.time()
+        self.last_trade_time = time.time() # Start hourly timer upon successful connection
 
         while True:
             self.update_connection_health()
@@ -1212,7 +1486,7 @@ class ForexTrader:
 
             state.status = "SCANNING_MARKET"
 
-            # Scan eligible Forex & Crypto pairs for aligned Supertrend + Echo Forecast setup
+            # 3. Standard Dual-Indicator Confluence Scan
             candidate_pairs = [p["pair"] for p in state.eligible_pairs[:6]] if state.eligible_pairs else [state.active_pair]
             signal_found = None
             selected_pair = state.active_pair
@@ -1231,24 +1505,82 @@ class ForexTrader:
                 # Short pause between scanning pairs
                 await asyncio.sleep(1.0)
 
+            # Update hourly timer state
+            elapsed_since_last_trade = time.time() - self.last_trade_time
+            state.time_since_last_trade = int(elapsed_since_last_trade)
+            state.time_until_hourly_trade = max(0, HOURLY_TRADE_INTERVAL - int(elapsed_since_last_trade))
+
             if signal_found and state.is_running and state.consecutive_losses < MAX_CONSECUTIVE_LOSSES:
                 self.is_trading = True
                 state.status = "TRADE_IN_PROGRESS"
-                await self.execute_trade(round_num, selected_pair, signal_found)
+                state.last_trade_type = "CONFLUENCE"
+                await self.execute_trade(round_num, selected_pair, signal_found, trade_type="CONFLUENCE")
                 round_num += 1
                 self.is_trading = False
+                self.last_trade_time = time.time()
                 state.status = "COOLING_DOWN"
                 await asyncio.sleep(5)
+
+            elif HOURLY_TRADE_ENABLED and elapsed_since_last_trade >= HOURLY_TRADE_INTERVAL and state.is_running and state.consecutive_losses < MAX_CONSECUTIVE_LOSSES and not self.is_trading:
+                # 4. Hourly Probability Fallback Trigger: No trades in the last hour!
+                mins_elapsed = round(elapsed_since_last_trade / 60)
+                print(f"\n⏰ [HOURLY PROBABILITY TRIGGER] No trades placed in the last {mins_elapsed} minutes!")
+                print("🔍 Scanning eligible Forex & Crypto pairs to punch trade with HIGHEST statistical probability...")
+                state.status = "SCANNING_HOURLY_PROBABILITY"
+
+                best_candidate = await self.find_highest_probability_trade()
+                if best_candidate and state.is_running and state.consecutive_losses < MAX_CONSECUTIVE_LOSSES:
+                    print(f"🎯 [HOURLY TRADE SELECTED] Pair: {best_candidate['pair']} | Dir: {best_candidate['direction'].upper()} | Win Prob: {best_candidate['probability']}% | Payout: {best_candidate['payout']}%")
+                    print(f"   Reason: Echo {best_candidate['echo_dir']} (Corr: {best_candidate['echo_corr']:.2f}, Proj: {best_candidate['echo_proj']:+.2f}%) & MA Sabres {best_candidate['sabres_dir']}")
+                    state.last_setup_info = f"[HOURLY {best_candidate['pair']} 1m] Prob: {best_candidate['probability']}% {best_candidate['direction'].upper()} (Echo: {best_candidate['echo_dir']}, Sabres: {best_candidate['sabres_dir']})"
+
+                    self.is_trading = True
+                    state.status = "TRADE_IN_PROGRESS"
+                    state.last_trade_type = "HOURLY_PROB"
+                    state.last_evaluated_prob = best_candidate['probability']
+                    await self.execute_trade(
+                        round_num,
+                        best_candidate['pair'],
+                        best_candidate['direction'],
+                        trade_type="HOURLY_PROB",
+                        prob=best_candidate['probability']
+                    )
+                    round_num += 1
+                    self.is_trading = False
+                    self.last_trade_time = time.time()
+                    state.status = "COOLING_DOWN"
+                    await asyncio.sleep(5)
+                else:
+                    print("⚠️ Could not find suitable hourly probability candidate. Will re-evaluate in next cycle.")
+                    await asyncio.sleep(15)
             else:
                 # Wait before next candle scan cycle (15s)
                 await asyncio.sleep(15)
 
-    async def execute_trade(self, round_num: int, pair: str, direction: str):
+    async def execute_trade(
+        self,
+        round_num: int,
+        pair: str,
+        direction: str,
+        trade_type: str = "CONFLUENCE",
+        prob: float = 0.0
+    ):
         duration = state.current_duration_seconds
         amount = state.current_bet
 
+        # Live Real Account Risk & Balance Protection
+        if state.account_type == "real" and state.current_balance > 0 and state.current_balance < amount:
+            alert_msg = f"🛑 [LIVE RISK GUARD] Live balance (${state.current_balance:.2f}) is below trade amount (${amount:.2f})! Bot paused to protect capital."
+            print(alert_msg)
+            state.status = "PAUSED: LOW LIVE BALANCE"
+            state.last_setup_info = alert_msg
+            state.is_running = False
+            return
+
         dur_mins = round(duration / 60)
-        print(f"\n🚀 [EXECUTING TRADE #{round_num}] Pair: {pair} | Dir: {direction.upper()} | Bet: ${amount:.2f} | Duration: {dur_mins}m ({duration}s)")
+        mode_prefix = "🔴 [LIVE TRADE]" if state.account_type == "real" else "🧪 [DEMO TRADE]"
+        prob_str = f" [Win Prob: {prob}%]" if trade_type == "HOURLY_PROB" else ""
+        print(f"\n🚀 {mode_prefix} [TRADE #{round_num} ({trade_type}){prob_str}] Pair: {pair} | Dir: {direction.upper()} | Bet: ${amount:.2f} | Duration: {dur_mins}m ({duration}s)")
 
         loop = asyncio.get_running_loop()
         self._trade_future = loop.create_future()
@@ -1263,7 +1595,9 @@ class ForexTrader:
         )
 
         if not order_res or not order_res.get("id"):
-            print(f"❌ Failed to place trade on {pair}: {order_res}")
+            err_msg = order_res.get("message") or order_res.get("error") if isinstance(order_res, dict) else str(order_res)
+            print(f"❌ Failed to place trade on {pair}: {err_msg}")
+            state.last_setup_info = f"Order failed on {pair}: {err_msg}"
             return
 
         trade_id = order_res["id"]
@@ -1275,7 +1609,7 @@ class ForexTrader:
             timeout = duration + 60.0
             print(f"⏳ Trade #{round_num} open (ID: {trade_id}). Waiting for {dur_mins}m expiry...")
             trade_closed = await asyncio.wait_for(self._trade_future, timeout=timeout)
-            self.process_trade_result(round_num, pair, direction, amount, strike, duration, trade_closed)
+            self.process_trade_result(round_num, pair, direction, amount, strike, duration, trade_closed, trade_type, prob)
         except asyncio.TimeoutError:
             print(f"⚠️ Timeout waiting for trade closure event after {dur_mins}m.")
         finally:
@@ -1290,7 +1624,9 @@ class ForexTrader:
         amount: float,
         strike: float,
         duration: int,
-        info: Dict[str, Any]
+        info: Dict[str, Any],
+        trade_type: str = "CONFLUENCE",
+        prob: float = 0.0
     ):
         status = info.get("status", "").lower()
         balance_change = float(info.get("balance_change", 0.0))
@@ -1325,6 +1661,8 @@ class ForexTrader:
             state.recent_trades.appendleft({
                 "round": round_num,
                 "time": time.time(),
+                "type": trade_type,
+                "prob": prob,
                 "pair": pair,
                 "dir": direction,
                 "duration": duration,
@@ -1376,6 +1714,8 @@ class ForexTrader:
             state.recent_trades.appendleft({
                 "round": round_num,
                 "time": time.time(),
+                "type": trade_type,
+                "prob": prob,
                 "pair": pair,
                 "dir": direction,
                 "duration": duration,
@@ -1392,6 +1732,8 @@ class ForexTrader:
             state.recent_trades.appendleft({
                 "round": round_num,
                 "time": time.time(),
+                "type": trade_type,
+                "prob": prob,
                 "pair": pair,
                 "dir": direction,
                 "duration": duration,

@@ -1,0 +1,71 @@
+"""
+=====================================================================
+🔴 OLYMPTRADE LIVE REAL MONEY TRADING BOT LAUNCHER
+Strategy: MA Sabres [LuxAlgo] (TEMA 50, 20) + LuxAlgo Echo Forecast (50, 50)
+Timeframe: Fixed 1-Minute (60s) Candles
+Target: Real Forex & Crypto Pairs (Payout >= 80%, Strictly No OTC)
+Hourly Fallback: Punches highest win-probability trade every 60m if no setup found
+Durations: 8 min -> 16 min -> 32 min -> Stop completely at 3 Consecutive Losses
+Capital Protection: Auto-halts if live balance is below current bet
+=====================================================================
+"""
+import os
+import sys
+
+# Force Live Real Account Mode
+os.environ["ACCOUNT_TYPE"] = "real"
+
+# Set base bet (defaults to 70 / ₹70)
+if "BASE_AMOUNT" not in os.environ:
+    os.environ["BASE_AMOUNT"] = "70.0"
+
+# Import bot engine
+from render_bot import ForexTrader, start_http_server, get_token, PORT, BASE_AMOUNT, MAX_CONSECUTIVE_LOSSES
+import asyncio
+import threading
+
+def main():
+    print("=" * 70)
+    print("🔴 INITIALIZING OLYMPTRADE LIVE REAL MONEY TRADER")
+    print("=" * 70)
+    print("⚠️  WARNING: REAL CAPITAL IS AT RISK. TRADES WILL USE YOUR LIVE ACCOUNT BALANCE.")
+    print("=" * 70)
+    print(f"• Account Mode      : REAL (Live Money)")
+    print(f"• Starting Bet      : ${BASE_AMOUNT:.2f}")
+    print(f"• Trade Durations   : 8m (Step 1) -> 16m (Step 2) -> 32m (Step 3)")
+    print(f"• Max Loss Limit    : Stop completely after {MAX_CONSECUTIVE_LOSSES} consecutive losses")
+    print(f"• Strategy          : MA Sabres [LuxAlgo] (TEMA 50, 20) + LuxAlgo Echo Forecast (50, 50)")
+    print(f"• Timeframe         : Fixed 1-Minute (60s) Candles")
+    print(f"• Assets Filter     : Real Forex & Crypto Pairs (No OTC) with Payout >= 80%")
+    print(f"• Hourly Fallback   : Active (Every 60m punches highest probability trade if no setup found)")
+    print(f"• Local Dashboard   : http://localhost:{PORT}")
+    print("=" * 70)
+
+    token = get_token()
+
+    # 1. Start Web Dashboard in background thread
+    dash_thread = threading.Thread(target=start_http_server, daemon=True)
+    dash_thread.start()
+
+    # 2. Run Trading Engine with Reconnect Loop
+    async def run_trader_loop():
+        while True:
+            try:
+                token = get_token()
+                trader = ForexTrader(token)
+                await trader.start()
+            except Exception as e:
+                err = str(e)
+                print(f"\n❌ [CONNECTION ERROR] {err}")
+                if "invalid_token" in err.lower() or "1008" in err.lower():
+                    print("🛑 [TOKEN EXPIRED] Your OlympTrade access token has expired!")
+                    print("👉 Please get a fresh token from your browser and update .env")
+                await asyncio.sleep(10)
+
+    try:
+        asyncio.run(run_trader_loop())
+    except KeyboardInterrupt:
+        print("\n👋 Live Bot stopped by user (Ctrl+C).")
+
+if __name__ == "__main__":
+    main()
